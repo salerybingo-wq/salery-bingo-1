@@ -16,6 +16,7 @@ export interface PostgresUser {
   ban_reason?: string;
   is_verified?: boolean;
   referred_by?: string;
+  share_bonus_awarded?: boolean;
 }
 
 export interface PostgresTransaction {
@@ -70,8 +71,8 @@ const schemaSql = `
     full_name TEXT,
     username TEXT,
     phone_number TEXT,
-    balance NUMERIC DEFAULT 10,
-    main_wallet NUMERIC DEFAULT 10,
+    balance NUMERIC DEFAULT 0,
+    main_wallet NUMERIC DEFAULT 0,
     play_wallet NUMERIC DEFAULT 0,
     role TEXT DEFAULT 'user',
     status TEXT DEFAULT 'active',
@@ -79,6 +80,7 @@ const schemaSql = `
     ban_reason TEXT,
     is_verified BOOLEAN DEFAULT false,
     referred_by TEXT,
+    share_bonus_awarded BOOLEAN DEFAULT false,
     referral_count INTEGER DEFAULT 0,
     total_deposited NUMERIC DEFAULT 0,
     total_withdrawn NUMERIC DEFAULT 0,
@@ -89,11 +91,14 @@ const schemaSql = `
   );
   ALTER TABLE public.users ADD COLUMN IF NOT EXISTS main_wallet NUMERIC;
   ALTER TABLE public.users ADD COLUMN IF NOT EXISTS play_wallet NUMERIC;
+  ALTER TABLE public.users ADD COLUMN IF NOT EXISTS share_bonus_awarded BOOLEAN DEFAULT false;
   UPDATE public.users
     SET main_wallet = COALESCE(main_wallet, balance, 0),
         play_wallet = COALESCE(play_wallet, 0);
   ALTER TABLE public.users ALTER COLUMN main_wallet SET DEFAULT 0;
   ALTER TABLE public.users ALTER COLUMN play_wallet SET DEFAULT 0;
+  UPDATE public.users SET share_bonus_awarded = false WHERE share_bonus_awarded IS NULL;
+  ALTER TABLE public.users ALTER COLUMN share_bonus_awarded SET DEFAULT false;
   CREATE TABLE IF NOT EXISTS public.transactions (
     id TEXT PRIMARY KEY,
     telegram_id TEXT NOT NULL,
@@ -154,6 +159,14 @@ const schemaSql = `
     state JSONB NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
+  CREATE TABLE IF NOT EXISTS public.bingo_broadcasts (
+    id TEXT PRIMARY KEY,
+    message TEXT NOT NULL,
+    photo_url TEXT,
+    target TEXT NOT NULL,
+    sent_count INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
   CREATE TABLE IF NOT EXISTS public.bingo_wallet_ledger (
     idempotency_key TEXT PRIMARY KEY,
     telegram_id TEXT NOT NULL,
@@ -176,7 +189,11 @@ const schemaSql = `
 function getPool(): Pool | null {
   if (pool !== undefined) return pool;
   const connectionString =
-    process.env.DATABASE_URL || process.env.POSTGRES_URL || process.env.POSTGRES_PRISMA_URL || '';
+    process.env.SUPABASE_DB_URL ||
+    process.env.DATABASE_URL ||
+    process.env.POSTGRES_URL ||
+    process.env.POSTGRES_PRISMA_URL ||
+    '';
   pool = connectionString
     ? new Pool({
         connectionString,
@@ -198,6 +215,42 @@ export async function initializePostgres(): Promise<boolean> {
   if (!client) return false;
   await ensureSchema(client);
   return true;
+}
+
+export async function savePostgresBroadcast(broadcast: {
+  id: string;
+  message: string;
+  photo_url?: string;
+  target: string;
+  sent_count: number;
+  created_at?: string;
+}): Promise<Record<string, any> | null> {
+  const client = getPool();
+  if (!client) return null;
+  await ensureSchema(client);
+  const result = await client.query(
+    `INSERT INTO public.bingo_broadcasts (id, message, photo_url, target, sent_count, created_at)
+     VALUES ($1, $2, $3, $4, $5, COALESCE($6::timestamptz, NOW()))
+     ON CONFLICT (id) DO UPDATE SET
+       message = EXCLUDED.message,
+       photo_url = EXCLUDED.photo_url,
+       target = EXCLUDED.target,
+       sent_count = EXCLUDED.sent_count
+     RETURNING *`,
+    [broadcast.id, broadcast.message, broadcast.photo_url || null, broadcast.target, broadcast.sent_count, broadcast.created_at || null]
+  );
+  return result.rows[0] || null;
+}
+
+export async function getPostgresBroadcasts(limit = 200): Promise<Record<string, any>[] | null> {
+  const client = getPool();
+  if (!client) return null;
+  await ensureSchema(client);
+  const result = await client.query(
+    'SELECT id, message, photo_url, target, sent_count, created_at FROM public.bingo_broadcasts ORDER BY created_at DESC LIMIT $1',
+    [Math.max(1, Math.min(500, Math.floor(limit)))]
+  );
+  return result.rows;
 }
 
 async function ensureSchema(client: Pool | PoolClient): Promise<void> {
@@ -251,8 +304,8 @@ export async function upsertPostgresUser(user: PostgresUser): Promise<Record<str
     RETURNING *`,
     [
       String(user.telegram_id), user.player_code || '', user.first_name || '', user.full_name || '',
-      user.username || '', user.phone_number || '', Number(user.main_wallet ?? user.balance ?? 10),
-      Number(user.main_wallet ?? user.balance ?? 10), Number(user.play_wallet ?? 0), user.role || 'user',
+      user.username || '', user.phone_number || '', Number(user.main_wallet ?? user.balance ?? 0),
+      Number(user.main_wallet ?? user.balance ?? 0), Number(user.play_wallet ?? 0), user.role || 'user',
       user.status || 'active', user.is_blocked ?? false, user.ban_reason || null,
       user.is_verified ?? false, user.referred_by || null,
     ]
@@ -316,7 +369,7 @@ export async function joinPostgresBingoRoom(input: {
   walletType: 'main_wallet' | 'play_wallet';
   cardIds: number[];
   initialState: BingoRoomState;
-}): Promise<{ state: BingoRoomState; balance: number; mainWallet: number; playWallet: number; duplicate: boolean } | null> {
+}): Promise<{ state: BingoRoomState; balance: number; mainWallet: number; playWallet: number; duplicate: boolean; spectator?: boolean } | null> {
   const poolClient = getPool();
   if (!poolClient) return null;
   await ensureSchema(poolClient);
@@ -362,7 +415,23 @@ export async function joinPostgresBingoRoom(input: {
         duplicate: true,
       };
     }
-    if (state.status !== 'waiting' && (state.status !== 'in_progress' || state.called.length > 5)) {
+    if (state.status === 'in_progress') {
+      const userResult = await client.query(
+        'SELECT balance, main_wallet, play_wallet FROM public.users WHERE telegram_id = $1',
+        [input.telegramId]
+      );
+      await client.query('COMMIT');
+      const account = userResult.rows[0];
+      return {
+        state,
+        balance: Number(account?.main_wallet ?? account?.balance ?? 0),
+        mainWallet: Number(account?.main_wallet ?? account?.balance ?? 0),
+        playWallet: Number(account?.play_wallet ?? 0),
+        duplicate: false,
+        spectator: true,
+      };
+    }
+    if (state.status !== 'waiting') {
       throw new Error('This game has already started');
     }
 
@@ -393,7 +462,7 @@ export async function joinPostgresBingoRoom(input: {
       joinRequestId: input.joinRequestId,
     });
     const commission = input.walletType === 'main_wallet' ? Math.floor(cost * 0.2) : 0;
-    if (input.walletType === 'main_wallet') state.prizePool += cost - commission;
+    state.prizePool += cost;
     await client.query(
       'INSERT INTO public.bingo_wallet_ledger (idempotency_key, telegram_id, game_id, kind, wallet_type, amount) VALUES ($1, $2, $3, \'stake\', $4, $5)',
       [`stake:${state.gameId}:${input.telegramId}`, input.telegramId, state.gameId, input.walletType, cost]

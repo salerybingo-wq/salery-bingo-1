@@ -36,7 +36,7 @@ export interface WinValidationResult {
   multiplier: number;
 }
 
-export type GameStatus = 'idle' | 'cartela_select' | 'countdown' | 'in_progress' | 'paused' | 'game_over';
+export type GameStatus = 'idle' | 'cartela_select' | 'countdown' | 'starting' | 'in_progress' | 'paused' | 'game_over';
 
 export interface CompetitorPlayer {
   id: string;
@@ -60,6 +60,7 @@ export interface GameSettings {
 
 export interface UserProfile {
   telegramId: number;
+  shareBonusAwarded?: boolean;
   firstName: string;
   username: string;
   phoneNumber?: string;
@@ -124,4 +125,3 @@ export interface TransactionRecord {
   created_at: string;
   notes?: string;
 }
-

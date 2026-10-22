@@ -1,6 +1,6 @@
 import React from 'react';
 import { UserProfile, GameSettings } from '../types';
-import { Wallet, Trophy, Users, TrendingUp, Volume2, VolumeX, Globe, ShieldCheck, ChevronRight } from 'lucide-react';
+import { Wallet, Trophy, Users, TrendingUp, Volume2, VolumeX, Globe, ShieldCheck, ChevronRight, Share2 } from 'lucide-react';
 import { sounds } from '../utils/audio';
 
 interface ProfileViewProps {
@@ -18,18 +18,45 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
   onUpdateSettings,
   onOpenAdminPanel,
 }) => {
-  // Extract user's genuine Telegram display name and username
   const rawDisplayName = user.firstName || user.username || 'Player';
   const initial = rawDisplayName.charAt(0).toUpperCase();
   const displayName = user.firstName ? user.firstName : (user.username ? `@${user.username}` : 'Player');
   const userHandle = user.username ? (user.username.startsWith('@') ? user.username : `@${user.username}`) : `@player_${String(user.telegramId).slice(-4)}`;
   const playerUniqueId = user.playerCode || ('SB-' + (((Math.abs(Number(user.telegramId)) * 17) % 90000) + 10000));
   const [copiedId, setCopiedId] = React.useState(false);
+  const [isSharing, setIsSharing] = React.useState(false);
+  const [shareError, setShareError] = React.useState('');
 
   const handleCopyId = () => {
     navigator.clipboard.writeText(playerUniqueId);
     setCopiedId(true);
     setTimeout(() => setCopiedId(false), 2000);
+  };
+
+  const handleShare = async () => {
+    setIsSharing(true);
+    setShareError('');
+    try {
+      const shareData = {
+        title: 'Salery Bingo',
+        text: 'Join me for a game of Salery Bingo!',
+        url: window.location.href,
+      };
+      if (navigator.share) {
+        await navigator.share(shareData);
+      } else if (navigator.clipboard) {
+        await navigator.clipboard.writeText(`${shareData.text} ${shareData.url}`);
+      } else {
+        throw new Error('Sharing is not available in this browser');
+      }
+    } catch (error) {
+      if (error instanceof Error && error.name !== 'AbortError') {
+        console.error('Could not share the game link:', error);
+        setShareError('Could not share the game link. Please try again.');
+      }
+    } finally {
+      setIsSharing(false);
+    }
   };
 
   // Language cycle: am -> om -> en -> am
@@ -77,9 +104,9 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
           {displayName}
         </h1>
 
-        {/* Telegram Username Badge */}
+        {/* Local Player Username Badge */}
         <div className="mt-1 flex items-center gap-1.5 px-3 py-0.5 rounded-full bg-[#1e293b]/80 border border-[#38bdf8]/40 shadow-sm">
-          <span className="text-[10px] text-sky-400 font-bold uppercase tracking-wider">Telegram</span>
+          <span className="text-[10px] text-sky-400 font-bold uppercase tracking-wider">Player</span>
           <span className="text-xs text-sky-300 font-mono font-bold">{userHandle}</span>
         </div>
 
@@ -99,7 +126,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
           </button>
 
           <span className="text-[11px] text-slate-400 font-mono">
-            TG: {user.telegramId}
+            ID: {String(user.telegramId).slice(-4)}
           </span>
         </div>
 
@@ -170,6 +197,19 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
           <div className="text-2xl font-black text-amber-400 font-mono drop-shadow">
             {(user.totalWonAmount || 0).toLocaleString()} ETB
           </div>
+        </div>
+
+        <div className="rounded-2xl border border-emerald-500/30 bg-[#1c1236] p-4 shadow-md">
+          <button
+            type="button"
+            onClick={handleShare}
+            disabled={isSharing}
+            className="w-full flex items-center justify-center gap-2 rounded-xl bg-emerald-600 px-4 py-3 text-sm font-bold text-white transition-colors hover:bg-emerald-500 disabled:cursor-not-allowed disabled:bg-slate-700"
+          >
+            <Share2 className="h-4 w-4" />
+            {isSharing ? 'Sharing...' : 'Share game'}
+          </button>
+          {shareError && <p className="mt-2 text-center text-xs text-rose-300">{shareError}</p>}
         </div>
 
         {/* Settings Section: Clean & Focused (Only Language & Sound) */}
@@ -249,4 +289,3 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
     </div>
   );
 };
-

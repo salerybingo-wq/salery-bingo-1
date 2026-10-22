@@ -71,8 +71,8 @@ export const BannedUserView: React.FC<BannedUserViewProps> = ({ user, onRefresh 
             <span className="text-[#54a9eb] font-mono font-bold">{user.playerCode || 'SB0000'}</span>
           </div>
           <div className="flex justify-between items-center text-[#708499]">
-            <span>Telegram ID፦</span>
-            <span className="text-slate-300 font-mono">{user.telegramId}</span>
+            <span>Player ID፦</span>
+            <span className="text-slate-300 font-mono">{String(user.telegramId).slice(-4)}</span>
           </div>
         </div>
 

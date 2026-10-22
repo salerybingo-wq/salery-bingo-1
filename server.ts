@@ -3,6 +3,7 @@ dotenv.config();
 
 import fs from 'fs';
 import { createServer } from 'node:http';
+import { randomInt } from 'node:crypto';
 import express from 'express';
 import cors from 'cors';
 import { Server as SocketServer } from 'socket.io';
@@ -12,15 +13,18 @@ import WebSocket from 'ws';
 import TelegramBot from 'node-telegram-bot-api';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { localDb, DbUser, DbTransaction, DbGameLog, DbBroadcast, DbMedia } from './server/db';
-import { attachBingoRooms, validateTelegramInitData } from './server/bingo';
+import { isValidBingoGuestToken, minimumLocalTestBalance, signBingoGuestToken } from './server/guestAuth';
+import { attachBingoRooms, isLoopbackClientAllowed, validateTelegramInitData } from './server/bingo';
 import {
   deletePostgresTransaction,
   getPostgresTransactions,
+  getPostgresBroadcasts,
   getPostgresUser,
   getPostgresUsers,
   initializePostgres,
   isPostgresConfigured,
   savePostgresTransaction,
+  savePostgresBroadcast,
   setPostgresUserBalance,
   setPostgresUserWallets,
   setPostgresUserStatus,
@@ -45,7 +49,13 @@ if (typeof (globalThis as any).WebSocket === 'undefined') {
 }
 
 // Initialize Supabase Client with robust auto-discovery
-let supabaseUrl = (process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || '').trim();
+const PRODUCTION_SUPABASE_URL = 'https://sqmicjzafgcymcfdjlai.supabase.co';
+const isProduction = process.env.NODE_ENV === 'production';
+let supabaseUrl = (
+  isProduction
+    ? PRODUCTION_SUPABASE_URL
+    : process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || PRODUCTION_SUPABASE_URL
+).trim();
 if (!supabaseUrl) {
   for (const [k, v] of Object.entries(process.env)) {
     if (typeof v !== 'string' || !v.trim()) continue;
@@ -112,7 +122,7 @@ export function getSupabase(): SupabaseClient | null {
   if (supabase) return supabase;
 
   // 1. Check local secure database for configured Supabase credentials
-  const savedSupa = localDb.getSupabaseConfig();
+  const savedSupa = isProduction ? { url: '', key: '' } : localDb.getSupabaseConfig();
 
   // 2. Re-check env vars dynamically
   let cleanUrl = (savedSupa.url || supabaseUrl || '').replace(/^['"]|['"]$/g, '').trim();
@@ -268,7 +278,7 @@ export async function upsertUserAdaptive(payload: Record<string, any>) {
         id: numId,
         telegram_id: String(payload.telegram_id),
         username: String(payload.username || ''),
-        balance: payload.balance ?? 10,
+        balance: payload.balance ?? 0,
       };
       continue;
     }
@@ -276,7 +286,7 @@ export async function upsertUserAdaptive(payload: Record<string, any>) {
       currentPayload = {
         telegram_id: String(payload.telegram_id),
         username: String(payload.username || ''),
-        balance: payload.balance ?? 10,
+        balance: payload.balance ?? 0,
       };
       continue;
     }
@@ -311,6 +321,7 @@ let activeBotUsername: string = (
 ).replace('@', '').trim();
 let isLongPollingRunning = false;
 let currentPollingInstanceId = '';
+let currentPollingToken = '';
 
 if (!savedBotConfig.bot_token) {
   localDb.saveBotConfig(activeBotToken, activeBotUsername);
@@ -415,7 +426,11 @@ function getVerifiedRequestUser(req: express.Request) {
   const authorization = req.headers.authorization || '';
   if (!authorization.startsWith('tma ')) return null;
   const walletBotToken = process.env.BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN || '';
-  return validateTelegramInitData(authorization.slice(4), walletBotToken);
+  return validateTelegramInitData(
+    authorization.slice(4),
+    walletBotToken,
+    isLoopbackClientAllowed(req.headers.origin, req.socket.remoteAddress)
+  );
 }
 
 function requireVerifiedAdmin(req: express.Request, res: express.Response): boolean {
@@ -531,6 +546,19 @@ const inMemoryBroadcastHistory: BroadcastRecord[] = [
   },
 ];
 
+async function persistBroadcastRecord(record: BroadcastRecord): Promise<void> {
+  if (isPostgresConfigured()) {
+    const saved = await savePostgresBroadcast(record);
+    if (!saved) throw new Error('Supabase PostgreSQL did not save the broadcast record');
+  } else if (isProduction) {
+    throw new Error('Cannot persist broadcast history: Supabase PostgreSQL is unavailable');
+  } else {
+    localDb.addBroadcast(record);
+  }
+  inMemoryBroadcastHistory.unshift(record);
+  if (inMemoryBroadcastHistory.length > 200) inMemoryBroadcastHistory.pop();
+}
+
 const inMemoryMediaGallery: MediaItem[] = [
   {
     id: 'med_bonus',
@@ -611,7 +639,7 @@ async function getOrCreateTelegramUser(from: {
   const existing = localDb.getUser(telegramId);
   if (existing) {
     const role = isAdminUser(telegramId) ? 'admin' : (existing.role || 'user');
-    const finalBalance = Number(existing.balance !== undefined ? existing.balance : (role === 'admin' ? 24560 : 0));
+    const finalBalance = Number(existing.balance ?? 0);
     existing.balance = finalBalance;
     existing.updated_at = new Date().toISOString();
     localDb.upsertUser({
@@ -656,7 +684,7 @@ async function getOrCreateTelegramUser(from: {
           first_name: supaUser.first_name || from.first_name || '',
           full_name: supaUser.full_name || fullName,
           phone_number: supaUser.phone_number || '',
-          balance: Number(supaUser.balance !== undefined ? supaUser.balance : (userRole === 'admin' ? 24560 : 0)),
+          balance: Number(supaUser.balance ?? 0),
           role: userRole === 'admin' ? 'admin' : (supaUser.role || 'user'),
           status: supaUser.status || 'active',
           is_blocked: !!supaUser.is_blocked,
@@ -689,9 +717,9 @@ async function getOrCreateTelegramUser(from: {
     console.warn('Supabase check user error:', err);
   }
 
-  // 3. Genuinely new user! Starts with 0 Main Wallet, 10 ETB in Play Wallet (Bonus for playing first game!)
-  const initialMain = userRole === 'admin' ? 24560 : 0;
-  const initialPlay = userRole === 'admin' ? 0 : 10;
+  // New accounts start with no wallet credit.
+  const initialMain = 0;
+  const initialPlay = 0;
   const cachedVerified = verifiedUsersCache[telegramId];
   const userEverVerified = isUserEverVerified(telegramId) || !!cachedVerified?.phone;
   const effectivePhone = cachedVerified?.phone || '';
@@ -732,7 +760,7 @@ async function getOrCreateTelegramUser(from: {
     return null;
   });
 
-  // Reward referrer with 5 ETB into Play Wallet if user was referred
+  // Reward referrers with 5 ETB into their Play Wallet for each new referred player.
   if (referredBy && String(referredBy) !== telegramId) {
     const refUser = localDb.getUser(String(referredBy));
     if (refUser) {
@@ -868,7 +896,7 @@ async function getUserBalance(telegramId: string): Promise<number> {
   if (user && typeof user.balance === 'number') {
     return user.balance;
   }
-  return isAdminUser(telegramId) ? 24560 : 0;
+  return 0;
 }
 
 /**
@@ -914,7 +942,7 @@ async function getUserFull(telegramId: string) {
           full_name: supaUser.full_name || supaUser.first_name || 'Player',
           username: supaUser.username || '',
           phone_number: supaUser.phone_number || '',
-          balance: Number(supaUser.balance ?? (isAdminUser(tId) ? 24560 : 0)),
+          balance: Number(supaUser.balance ?? 0),
           role: supaUser.role || (isAdminUser(tId) ? 'admin' : 'user'),
           status: supaUser.status || (supaUser.is_blocked ? 'blocked' : 'active'),
           is_blocked: !!supaUser.is_blocked || supaUser.status === 'blocked',
@@ -934,7 +962,7 @@ async function getUserFull(telegramId: string) {
   if (user) {
     const code = user.player_code || generatePlayerCode(tId);
     const role = isAdminUser(tId) ? 'admin' : (user.role || 'user');
-    const balance = Number(user.balance ?? (role === 'admin' ? 24560 : 0));
+    const balance = Number(user.balance ?? 0);
     return {
       ...user,
       player_code: code,
@@ -1562,14 +1590,14 @@ async function processTelegramUpdate(update: any, botToken: string) {
             first_name: fromUser.first_name || 'Player',
             full_name: (fromUser.first_name || 'Player') + (fromUser.last_name ? ' ' + fromUser.last_name : ''),
             username: fromUser.username || '',
-            balance: 10,
+            balance: 0,
             role: 'user',
             status: 'active',
           });
           fullUser = {
             ...registered,
             role: 'user',
-            balance: 10,
+            balance: 0,
             player_code: registered.player_code,
           };
           try {
@@ -1819,7 +1847,7 @@ async function processTelegramUpdate(update: any, botToken: string) {
         ]);
         keyboardButtons.push([
           { text: `🔄 Refresh Stats (${totalUsers} Users)`, callback_data: 'adm_refresh' },
-          { text: '🎮 Play Game', web_app: { url: buildWebAppUrl(webAppUrl, fromUser.id, 24560) } },
+          { text: '🎮 Play Game', web_app: { url: buildWebAppUrl(webAppUrl, fromUser.id, 0) } },
         ]);
 
         const adminKeyboard = { inline_keyboard: keyboardButtons };
@@ -1860,7 +1888,7 @@ async function processTelegramUpdate(update: any, botToken: string) {
         localDb.upsertUser({
           telegram_id: targetId,
           role: 'admin',
-          balance: 24560,
+          balance: 0,
           status: 'active',
           is_verified: true,
         });
@@ -1966,7 +1994,7 @@ async function processTelegramUpdate(update: any, botToken: string) {
         const userResult = await getOrCreateTelegramUser(fromUser, referredBy);
         const isAdmin = isAdminUser(fromUser.id);
         const userRecord = localDb.getUser(fromUser.id);
-        const currentBalance = userResult.balance !== undefined ? userResult.balance : (userRecord?.balance ?? (isAdmin ? 24560 : 0));
+        const currentBalance = userResult.balance ?? userRecord?.balance ?? 0;
         const playerCode = userResult.playerCode || userRecord?.player_code || generatePlayerCode(fromUser.id);
         const userPhone = userResult.phoneNumber || userRecord?.phone_number || verifiedUsersCache[String(fromUser.id)]?.phone || '';
         const isVerified = isUserEverVerified(fromUser.id) || !!(userPhone && String(userPhone).trim()) || !!userRecord?.is_verified;
@@ -2392,7 +2420,7 @@ async function processTelegramUpdate(update: any, botToken: string) {
 
         if (cleanText === 'play 🎮' || cleanText === 'play' || cleanText === '/play') {
           const fullUser = await getUserFull(fromUser.id);
-          const currentBal = fullUser?.balance || 10;
+          const currentBal = fullUser?.balance ?? 0;
           await sendTelegramMessage(
             botToken,
             chatId,
@@ -2410,7 +2438,7 @@ async function processTelegramUpdate(update: any, botToken: string) {
           const playerCode = existingBefore?.player_code || generatePlayerCode(fromUser.id);
           const playerName = fromUser.first_name || existingBefore?.first_name || 'Player';
           const fullName = [fromUser.first_name, fromUser.last_name].filter(Boolean).join(' ') || playerName;
-          const currentBal = existingBefore?.balance ?? 10;
+          const currentBal = existingBefore?.balance ?? 0;
 
           localDb.upsertUser({
             telegram_id: String(fromUser.id),
@@ -2598,24 +2626,41 @@ async function processTelegramUpdate(update: any, botToken: string) {
 function stopLongPolling(reason = 'restart') {
   currentPollingInstanceId = `stopped_${Date.now()}`;
   isLongPollingRunning = false;
+  currentPollingToken = '';
   console.log(`🛑 Stopping Telegram long polling (${reason})`);
 }
 
+function isTelegramBotEnabled() {
+  if (process.env.DISABLE_TELEGRAM_BOT?.trim().toLowerCase() === 'true') return false;
+  return process.env.NODE_ENV === 'production';
+}
+
 function isTelegramPollingEnabled() {
-  if (process.env.ENABLE_TELEGRAM_POLLING === 'false') return false;
+  if (!isTelegramBotEnabled()) return false;
+  if (process.env.ENABLE_TELEGRAM_POLLING?.trim().toLowerCase() === 'false') return false;
   if (process.env.TELEGRAM_WEBHOOK_URL && process.env.TELEGRAM_WEBHOOK_URL.trim().startsWith('http')) return false;
   return true;
 }
 
 async function startLongPolling(botToken: string) {
+  if (!isTelegramPollingEnabled()) {
+    console.info('Telegram polling disabled by local or environment configuration.');
+    return;
+  }
   if (!botToken || !botToken.includes(':') || botToken.length < 15) {
     console.warn('Cannot start Telegram long polling: invalid or missing token.');
+    return;
+  }
+
+  if (isLongPollingRunning && currentPollingToken === botToken) {
+    console.info('Telegram long polling is already active for this process.');
     return;
   }
 
   stopLongPolling('before-new-instance');
   const instanceId = `${Date.now()}_${Math.floor(Math.random() * 100000)}`;
   currentPollingInstanceId = instanceId;
+  currentPollingToken = botToken;
   isLongPollingRunning = true;
 
   console.log(`🚀 Starting Telegram Long Polling (Instance: ${instanceId})...`);
@@ -2657,14 +2702,9 @@ async function startLongPolling(botToken: string) {
       } else if (!data.ok) {
         if (data.error_code === 409) {
           consecutiveConflicts++;
-          console.warn(
-            `⚠️ Telegram 409 Conflict (Attempt ${consecutiveConflicts}): Another instance or webhook is active.`
-          );
-          try {
-            await fetch(
-              `https://api.telegram.org/bot${botToken}/deleteWebhook?drop_pending_updates=true`
-            );
-          } catch (e) {}
+          if (consecutiveConflicts === 1) {
+            console.warn('Telegram polling conflict: another poller is using this token; retrying with backoff.');
+          }
 
           const delay = Math.min(30000, 5000 * consecutiveConflicts);
           await new Promise((r) => setTimeout(r, delay));
@@ -2697,6 +2737,7 @@ async function startLongPolling(botToken: string) {
 
   if (currentPollingInstanceId === instanceId) {
     isLongPollingRunning = false;
+    currentPollingToken = '';
   }
 }
 
@@ -2704,6 +2745,7 @@ async function startServer() {
   const app = express();
   const httpServer = createServer(app);
   const PORT = Number(process.env.PORT) || 8080;
+  const HOST = isProduction ? '0.0.0.0' : process.env.HOST || '0.0.0.0';
   const socketServer = new SocketServer(httpServer, {
     cors: {
       origin: (_origin, callback) => callback(null, true),
@@ -2712,7 +2754,7 @@ async function startServer() {
     },
     transports: ['websocket', 'polling'],
   });
-  attachBingoRooms(socketServer, process.env.BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN || '');
+  attachBingoRooms(socketServer);
 
   app.use(
     cors({
@@ -2793,10 +2835,125 @@ async function startServer() {
     });
   });
 
+  app.post('/api/bingo/guest-session', async (req, res) => {
+    try {
+      if (!signBingoGuestToken(0)) {
+        return res.status(503).json({ ok: false, error: 'BINGO_GUEST_SECRET must be configured with at least 32 characters' });
+      }
+      const existingPlayerId = Number(req.body?.playerId);
+      const existingToken = req.body?.token;
+      const isLocalTestRequest = isLoopbackClientAllowed(req.headers.origin, req.socket.remoteAddress);
+      if (
+        Number.isSafeInteger(existingPlayerId) &&
+        existingPlayerId > 0 &&
+        isValidBingoGuestToken(existingPlayerId, existingToken)
+      ) {
+        let existingAccount = isPostgresConfigured()
+          ? await getPostgresUser(String(existingPlayerId))
+          : localDb.getUser(String(existingPlayerId));
+        if (existingAccount) {
+          let mainWallet = Number(existingAccount.main_wallet ?? existingAccount.balance ?? 0);
+          let balance = Number(existingAccount.balance ?? mainWallet);
+          if (isLocalTestRequest) {
+            mainWallet = minimumLocalTestBalance(mainWallet, balance);
+            balance = mainWallet;
+            if (isPostgresConfigured()) {
+              const updatedBalance = await setPostgresUserBalance(String(existingPlayerId), mainWallet);
+              if (updatedBalance === null) throw new Error('Could not update the local test wallet balance');
+              existingAccount = { ...existingAccount, balance: updatedBalance, main_wallet: updatedBalance };
+              mainWallet = updatedBalance;
+              balance = updatedBalance;
+            } else {
+              existingAccount = localDb.upsertUser({
+                ...existingAccount,
+                telegram_id: String(existingPlayerId),
+                balance: mainWallet,
+                main_wallet: mainWallet,
+              });
+            }
+          }
+          const playWallet = Number(existingAccount.play_wallet ?? 0);
+          return res.json({
+            ok: true,
+            playerId: existingPlayerId,
+            token: existingToken,
+            balance,
+            mainWallet,
+            playWallet,
+            playerCode: existingAccount.player_code,
+          });
+        }
+      }
+
+      let playerId = 0;
+      let account: any = null;
+      const localTestBalance = isLocalTestRequest ? minimumLocalTestBalance() : 0;
+      for (let attempt = 0; attempt < 5 && !account; attempt++) {
+        playerId = randomInt(1_000_000_000_000_000, 1_250_000_000_000_000);
+        const id = String(playerId);
+        if (localDb.getUser(id)) continue;
+        if (isPostgresConfigured() && await getPostgresUser(id)) continue;
+
+        const newUser: Partial<DbUser> & { telegram_id: string } = {
+          telegram_id: id,
+          player_code: generatePlayerCode(id),
+          first_name: 'Player',
+          full_name: 'Player',
+          username: `player_${id.slice(-4)}`,
+          balance: localTestBalance,
+          main_wallet: localTestBalance,
+          play_wallet: 0,
+          role: 'user',
+          status: 'active',
+          is_blocked: false,
+          is_verified: false,
+        };
+        account = isPostgresConfigured()
+          ? await upsertPostgresUser(newUser)
+          : localDb.upsertUser(newUser);
+        if (account && isPostgresConfigured()) {
+          localDb.upsertUser({
+            ...newUser,
+            balance: Number(account.balance ?? 0),
+            main_wallet: Number(account.main_wallet ?? account.balance ?? 0),
+            play_wallet: Number(account.play_wallet ?? 0),
+          });
+        }
+      }
+
+      if (!account) {
+        return res.status(503).json({ ok: false, error: 'Could not create a unique guest player account' });
+      }
+
+      const token = signBingoGuestToken(playerId);
+      if (!token) {
+        return res.status(503).json({ ok: false, error: 'BINGO_GUEST_SECRET must be configured with at least 32 characters' });
+      }
+      const mainWallet = Number(account.main_wallet ?? account.balance ?? 0);
+      const playWallet = Number(account.play_wallet ?? 0);
+      return res.json({
+        ok: true,
+        playerId,
+        token,
+        balance: Number(account.balance ?? mainWallet),
+        mainWallet,
+        playWallet,
+        playerCode: account.player_code,
+      });
+    } catch (error) {
+      console.error('Could not issue bingo guest session:', error);
+      return res.status(500).json({ ok: false, error: 'Could not issue bingo guest session' });
+    }
+  });
+
+  app.post('/api/user/:telegramId/share-bonus', async (req, res) => {
+    return res.status(410).json({ ok: false, error: 'Share bonuses are no longer credited to player wallets' });
+  });
+
   // Instant Player Registration & Sync Endpoint (Dual-written to Supabase & Local Database)
   app.post('/api/user/sync', async (req, res) => {
     try {
-      const { telegramId, firstName, username, phoneNumber, referredBy } = req.body;
+      const { telegramId, referredBy } = req.body;
       if (!telegramId) return res.status(400).json({ ok: false, error: 'telegramId is required' });
       if (!requireVerifiedPlayer(req, res, String(telegramId))) return;
 
@@ -2805,12 +2962,25 @@ async function startServer() {
       const telegramUser = getVerifiedRequestUser(req)!;
       const userRole = isAdm ? 'admin' : 'user';
       const code = generatePlayerCode(tId);
+      const telegramFirstName = telegramUser.first_name || 'Player';
+      const telegramFullName = [telegramUser.first_name, telegramUser.last_name].filter(Boolean).join(' ') || 'Player';
 
       // 1. Read and upsert the shared PostgreSQL profile, then refresh the local cache.
       const postgresExisting = await getPostgresUser(tId).catch((err) => {
         console.warn('PostgreSQL user lookup failed during sync:', err);
         return null;
       });
+      const client = getSupabase();
+      let supabaseExisting: Record<string, any> | null = null;
+      if (!postgresExisting && client) {
+        try {
+          const { data, error } = await client.from('users').select('*').eq('telegram_id', tId).maybeSingle();
+          if (error) console.warn('Supabase user lookup failed during Telegram registration:', error.message);
+          else supabaseExisting = data;
+        } catch (error) {
+          console.warn('Supabase user lookup threw during Telegram registration:', error);
+        }
+      }
       let existing = postgresExisting
         ? localDb.upsertUser({
             telegram_id: tId,
@@ -2819,31 +2989,52 @@ async function startServer() {
             full_name: postgresExisting.full_name,
             username: postgresExisting.username,
             phone_number: postgresExisting.phone_number,
-            balance: Number(postgresExisting.balance ?? 0),
+            balance: Number(postgresExisting.main_wallet ?? postgresExisting.balance ?? 0),
+            main_wallet: Number(postgresExisting.main_wallet ?? postgresExisting.balance ?? 0),
+            play_wallet: Number(postgresExisting.play_wallet ?? 0),
             role: postgresExisting.role || userRole,
             status: postgresExisting.status,
             is_blocked: !!postgresExisting.is_blocked,
             is_verified: !!postgresExisting.is_verified,
             referred_by: postgresExisting.referred_by,
           })
+        : supabaseExisting
+        ? localDb.upsertUser({
+            telegram_id: tId,
+            player_code: supabaseExisting.player_code,
+            first_name: supabaseExisting.first_name,
+            full_name: supabaseExisting.full_name,
+            username: supabaseExisting.username,
+            phone_number: supabaseExisting.phone_number,
+            balance: Number(supabaseExisting.main_wallet ?? supabaseExisting.balance ?? 0),
+            main_wallet: Number(supabaseExisting.main_wallet ?? supabaseExisting.balance ?? 0),
+            play_wallet: Number(supabaseExisting.play_wallet ?? 0),
+            role: supabaseExisting.role || userRole,
+            status: supabaseExisting.status,
+            is_blocked: !!supabaseExisting.is_blocked,
+            is_verified: !!supabaseExisting.is_verified,
+            referred_by: supabaseExisting.referred_by,
+          })
         : localDb.getUser(tId);
-      let finalBalance = existing ? existing.balance : (isAdm ? 24560 : 0);
+      let finalBalance = existing ? existing.balance : 0;
 
       const updatedUser = localDb.upsertUser({
         telegram_id: tId,
         player_code: code,
-        first_name: telegramUser.first_name || firstName || (existing ? existing.first_name : 'Player'),
-        full_name: telegramUser.first_name || firstName || (existing ? existing.full_name : 'Player'),
-        username: telegramUser.username || username || (existing ? existing.username : ''),
-        phone_number: phoneNumber || (existing ? existing.phone_number : ''),
+        first_name: telegramFirstName,
+        full_name: telegramFullName,
+        username: telegramUser.username || existing?.username || '',
+        phone_number: existing?.phone_number || '',
         balance: finalBalance,
         role: userRole,
         status: existing?.status || 'active',
         is_blocked: !!existing?.is_blocked,
-        is_verified: !!phoneNumber || !!existing?.is_verified,
+        is_verified: !!existing?.is_verified,
         referred_by: referredBy || existing?.referred_by,
       });
 
+      const mainWallet = Number(updatedUser.main_wallet ?? finalBalance);
+      const playWallet = Number(updatedUser.play_wallet ?? 0);
       const postgresUser = await upsertPostgresUser({
         telegram_id: tId,
         player_code: code,
@@ -2852,6 +3043,8 @@ async function startServer() {
         username: updatedUser.username,
         phone_number: updatedUser.phone_number,
         balance: finalBalance,
+        main_wallet: mainWallet,
+        play_wallet: playWallet,
         role: userRole,
         status: updatedUser.status,
         is_blocked: updatedUser.is_blocked,
@@ -2863,7 +3056,6 @@ async function startServer() {
       });
 
       // 2. Sync to Supabase database in a split second
-      const client = getSupabase();
       let supaSynced = false;
       if (client) {
         try {
@@ -2875,6 +3067,8 @@ async function startServer() {
             username: updatedUser.username,
             phone_number: updatedUser.phone_number,
             balance: finalBalance,
+            main_wallet: mainWallet,
+            play_wallet: playWallet,
             role: userRole,
             status: updatedUser.status,
             is_blocked: updatedUser.is_blocked,
@@ -2908,6 +3102,7 @@ async function startServer() {
   app.get('/api/user/:telegramId', async (req, res) => {
     const telegramId = String(req.params.telegramId);
     if (!requireVerifiedPlayer(req, res, telegramId)) return;
+    const isLocalTestRequest = isLoopbackClientAllowed(req.headers.origin, req.socket.remoteAddress);
     const postgresUser = await getPostgresUser(telegramId).catch((err) => {
       console.warn('PostgreSQL profile lookup failed:', err);
       return null;
@@ -2927,7 +3122,7 @@ async function startServer() {
             full_name: supaUser.full_name || supaUser.first_name || 'Player',
             username: supaUser.username || '',
             phone_number: supaUser.phone_number || '',
-            balance: Number(supaUser.balance ?? (isAdminUser(telegramId) ? 24560 : 0)),
+            balance: Number(supaUser.balance ?? 0),
             role: supaUser.role || (isAdminUser(telegramId) ? 'admin' : 'user'),
             status: supaUser.status || (supaUser.is_blocked ? 'blocked' : 'active'),
             is_blocked: !!supaUser.is_blocked || supaUser.status === 'blocked',
@@ -2942,8 +3137,8 @@ async function startServer() {
     if (!fullUser) {
       // Auto-register in localDb
       const devRole = isAdminUser(telegramId) ? 'admin' : 'user';
-      const devBalance = isAdminUser(telegramId) ? 24560 : 0;
-      const devPlay = isAdminUser(telegramId) ? 0 : 10;
+      const devBalance = 0;
+      const devPlay = 0;
       fullUser = localDb.upsertUser({
         telegram_id: telegramId,
         balance: devBalance,
@@ -2962,7 +3157,19 @@ async function startServer() {
       }
     }
 
-    const mainWallet = Number((postgresUser as any)?.main_wallet ?? (fullUser as any)?.main_wallet ?? fullUser.balance);
+    let mainWallet = Number((postgresUser as any)?.main_wallet ?? (fullUser as any)?.main_wallet ?? fullUser.balance);
+    if (isLocalTestRequest && mainWallet < minimumLocalTestBalance()) {
+      mainWallet = minimumLocalTestBalance(mainWallet, fullUser.balance);
+      if (postgresUser) {
+        const updatedBalance = await setPostgresUserBalance(telegramId, mainWallet);
+        if (updatedBalance === null) {
+          return res.status(503).json({ ok: false, error: 'Could not update the local test wallet balance' });
+        }
+        mainWallet = updatedBalance;
+      }
+      localDb.updateUserBalance(telegramId, mainWallet);
+      fullUser = { ...fullUser, balance: mainWallet, main_wallet: mainWallet };
+    }
     const playWallet = Number((postgresUser as any)?.play_wallet ?? (fullUser as any)?.play_wallet ?? 0);
     const balance = mainWallet;
     const isAdmin = isAdminUser(telegramId);
@@ -2990,6 +3197,7 @@ async function startServer() {
 
   // Admin endpoint: List all players from Supabase & Local Database
   app.get('/api/admin/users', async (req, res) => {
+    if (!requireVerifiedAdmin(req, res)) return;
     try {
       const client = getSupabase();
       const postgresUsers = await getPostgresUsers().catch((err) => {
@@ -3007,7 +3215,7 @@ async function startServer() {
             full_name: user.full_name || user.first_name || 'Player',
             username: user.username || '',
             phone_number: user.phone_number || '',
-            balance: Number(user.balance ?? 10),
+            balance: Number(user.balance ?? 0),
             role: user.role || (String(user.telegram_id) === '908336796' ? 'admin' : 'user'),
             status: user.status || (user.is_blocked ? 'blocked' : 'active'),
             is_blocked: !!user.is_blocked || user.status === 'blocked',
@@ -3032,7 +3240,7 @@ async function startServer() {
                   full_name: su.full_name || su.first_name || 'Player',
                   username: su.username || '',
                   phone_number: su.phone_number || '',
-                  balance: Number(su.balance ?? (String(su.telegram_id) === '908336796' ? 24560 : 0)),
+                  balance: Number(su.balance ?? 0),
                   role: su.role || (String(su.telegram_id) === '908336796' ? 'admin' : 'user'),
                   status: su.status || (su.is_blocked ? 'blocked' : 'active'),
                   is_blocked: !!su.is_blocked || su.status === 'blocked',
@@ -3054,7 +3262,7 @@ async function startServer() {
         const role = isAdmin ? 'admin' : (u.role || 'user');
         const isBlocked = u.status === 'blocked' || u.is_blocked === true;
         const banReason = u.ban_reason;
-        const balance = Number(u.balance ?? (role === 'admin' ? 24560 : 0));
+        const balance = Number(u.balance ?? 0);
 
         return {
           id: u.id,
@@ -3267,6 +3475,7 @@ async function startServer() {
 
   // Admin endpoint: Broadcast message or photo to users (Podcast/Broadcast Studio)
   app.post('/api/admin/broadcast', async (req, res) => {
+    if (!requireVerifiedAdmin(req, res)) return;
     const { message, targetTelegramId, photoUrl, photoTitle, botToken: bodyToken } = req.body;
     const botToken = bodyToken || getActiveBotToken(req);
 
@@ -3331,7 +3540,7 @@ async function startServer() {
           sent_count: 1,
           created_at: new Date().toISOString(),
         };
-        localDb.addBroadcast(record);
+        await persistBroadcastRecord(record);
 
         return res.json({
           ok: true,
@@ -3454,7 +3663,12 @@ async function startServer() {
         sent_count: deliveredCount || totalTargetCount,
         created_at: new Date().toISOString(),
       };
-      localDb.addBroadcast(record);
+      await persistBroadcastRecord(record);
+      socketServer.emit('admin:broadcast', {
+        message: finalCaptionOrText,
+        photoUrl: photoUrl || undefined,
+        createdAt: record.created_at,
+      });
 
       return res.json({
         ok: true,
@@ -3496,6 +3710,9 @@ async function startServer() {
 
   // Admin endpoint: Configure & verify Telegram bot token & WebApp URL dynamically
   app.post('/api/admin/bot-config', async (req, res) => {
+    if (!isTelegramBotEnabled()) {
+      return res.status(503).json({ ok: false, error: 'Telegram bot integration is disabled in local development' });
+    }
     const { botToken, botUsername, webAppUrl } = req.body;
     const cleanToken = String(botToken || activeBotToken || '').trim();
 
@@ -3542,7 +3759,6 @@ async function startServer() {
       // Save to local database persistence
       localDb.saveBotConfig(activeBotToken, activeBotUsername, targetWebUrl);
 
-      // Start or restart long polling cleanly with new token instance
       if (isTelegramPollingEnabled()) {
         startLongPolling(activeBotToken).catch((err) => {
           console.error('Long polling auto-start failed:', err);
@@ -3561,8 +3777,16 @@ async function startServer() {
   });
 
   // Admin endpoint: Get broadcast history
-  app.get('/api/admin/broadcast/history', (req, res) => {
-    res.json({ ok: true, history: inMemoryBroadcastHistory });
+  app.get('/api/admin/broadcast/history', async (_req, res) => {
+    try {
+      const persistedHistory = await getPostgresBroadcasts();
+      if (persistedHistory) return res.json({ ok: true, history: persistedHistory });
+      if (isProduction) return res.status(503).json({ ok: false, error: 'Broadcast history database is unavailable' });
+      return res.json({ ok: true, history: inMemoryBroadcastHistory });
+    } catch (error) {
+      console.error('Could not load persisted broadcast history:', error);
+      return res.status(503).json({ ok: false, error: 'Broadcast history database is unavailable' });
+    }
   });
 
   // Admin endpoint: Get media gallery (photos sent or uploaded)
@@ -4121,6 +4345,9 @@ async function startServer() {
 
   // Support Webhook endpoint for Telegram updates matching TELEGRAM_WEBHOOK_URL
   const webhookHandler = async (req: express.Request, res: express.Response) => {
+    if (!isTelegramBotEnabled()) {
+      return res.status(404).send('Telegram bot integration is disabled in local development');
+    }
     if (req.method === 'GET') {
       return res.json({
         status: 'ok',
@@ -4189,35 +4416,49 @@ async function startServer() {
     }
   }
 
-  httpServer.listen(Number(PORT), '0.0.0.0', () => {
-    console.log(`Salery Bingo Backend running on port ${PORT}`);
+  if (isProduction) {
+    const postgresUrl = (
+      process.env.SUPABASE_DB_URL ||
+      process.env.DATABASE_URL ||
+      process.env.POSTGRES_URL ||
+      process.env.POSTGRES_PRISMA_URL ||
+      ''
+    ).trim();
+    const serviceKey = (
+      process.env.SUPABASE_SERVICE_ROLE_KEY ||
+      process.env.SUPABASE_ROLE_KEY ||
+      process.env.SUPABASE_SERVICE_KEY ||
+      process.env.SUPABASE_SECRET_KEY ||
+      ''
+    ).trim();
+    if (!isPostgresConfigured() || !postgresUrl.toLowerCase().includes('sqmicjzafgcymcfdjlai')) {
+      throw new Error('Production requires a Supabase PostgreSQL connection string for project sqmicjzafgcymcfdjlai in SUPABASE_DB_URL.');
+    }
+    if (!serviceKey || !getSupabase()) {
+      throw new Error('Production requires a valid SUPABASE_SERVICE_ROLE_KEY and SUPABASE_URL.');
+    }
+    await initializePostgres();
+    console.info('Supabase PostgreSQL users, game state, and broadcast history tables are ready.');
+  }
 
-    if (isPostgresConfigured()) {
+  httpServer.listen(Number(PORT), HOST, () => {
+    console.log(`Salery Bingo Backend listening on http://${HOST}:${PORT}`);
+
+    if (!isProduction && isPostgresConfigured()) {
       initializePostgres()
-        .then(() => console.info('PostgreSQL users, deposits, and withdrawals tables are ready.'))
-        .catch((err: any) => console.warn('PostgreSQL startup initialization failed, falling back to local database:', err?.message || err));
+        .then(() => console.info('PostgreSQL tables are ready.'))
+        .catch((err: any) => console.warn('PostgreSQL startup initialization failed:', err?.message || err));
     }
 
-    // Dynamic background sync of local users and transactions to Supabase on server boot
+    // Development-only sync; production data is owned by Supabase PostgreSQL.
     try {
       const client = getSupabase();
-      if (client) {
+      if (client && !isProduction) {
         console.log('🔄 Server started with active Supabase connection. Running background sync for local database users...');
         const allLocalUsers = localDb.getAllUsers();
         const allLocalTxs = localDb.getTransactions();
 
         void (async () => {
-          // ONE-TIME CLEANUP: Wipe out old mock users, game logs, and transactions from Supabase to start 100% freshly clean!
-          try {
-            console.log('🧹 Remote Supabase Cleanup: Wiping out old mock records...');
-            await client.from('users').delete().neq('telegram_id', '908336796');
-            await client.from('transactions').delete().neq('id', 'keep_safe_none_existent_id');
-            await client.from('game_logs').delete().neq('id', 'keep_safe_none_existent_id');
-            console.log('✅ Remote Supabase database wiped clean of old test records!');
-          } catch (e) {
-            console.warn('Startup database wipe failed:', e);
-          }
-
           let syncedUsers = 0;
           for (const u of allLocalUsers) {
             try {
@@ -4256,7 +4497,9 @@ async function startServer() {
     }
 
     const botToken = getActiveBotToken();
-    if (botToken) {
+    if (!isTelegramBotEnabled()) {
+      console.info('Telegram bot initialization, webhooks, and polling disabled for local development.');
+    } else if (botToken) {
       // Auto-configure Telegram bottom-left WebApp Menu Button
       const webAppUrl = resolveWebAppUrl();
       fetch(`https://api.telegram.org/bot${botToken}/setChatMenuButton`, {
@@ -4284,12 +4527,13 @@ async function startServer() {
           .catch((err) => {
             console.error('Failed to configure Telegram webhook:', err);
           });
-      } else {
-        isLongPollingRunning = true;
+      } else if (isTelegramPollingEnabled()) {
         startLongPolling(botToken).catch((err) => {
           isLongPollingRunning = false;
           console.error('Long polling error:', err);
         });
+      } else {
+        console.info('🛑 Telegram bot polling disabled in local mode; app is running without bot startup.');
       }
     } else if (!botToken) {
       console.info('BOT_TOKEN is not set; configure Telegram from the Admin Panel when needed.');
@@ -4299,4 +4543,5 @@ async function startServer() {
 
 startServer().catch((err) => {
   console.error('FATAL startServer exception:', err);
+  process.exitCode = 1;
 });

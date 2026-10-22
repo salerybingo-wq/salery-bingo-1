@@ -2,7 +2,6 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   BingoBall,
   BingoCardModel,
-  CompetitorPlayer,
   GameSettings,
   GameStatus,
   UserProfile,
@@ -13,7 +12,6 @@ import {
   generateCartelaByNumber,
   checkCardWinningPatterns,
   calculateNumbersNeeded,
-  generateCompetitors,
   getLetterForNumber,
   getGlobalBingoCycle,
   getDeterministicRoundDeck
@@ -24,7 +22,6 @@ import { Header } from './components/Header';
 import { CallerBoard } from './components/CallerBoard';
 import { BingoCardView } from './components/BingoCardView';
 import { GameControls } from './components/GameControls';
-import { CompetitorList } from './components/CompetitorList';
 import { WinModal } from './components/WinModal';
 import { RulesModal } from './components/RulesModal';
 import { StatsModal } from './components/StatsModal';
@@ -39,11 +36,33 @@ import { ProfileView } from './components/ProfileView';
 import { AdminPanelView } from './components/AdminPanelView';
 import { BannedUserView } from './components/BannedUserView';
 import { AlertCircle, ArrowLeft, Flame } from 'lucide-react';
-import { fetchUserProfile, fetchPlayerGameHistory, logGameHistory, syncUserRegistration, subscribeToSupabaseTable } from './utils/api';
-import { BingoRoomSnapshot, BingoSocket, connectBingoSocket, emitBingoWithAck, BingoJoinResult, BingoClaimResult } from './utils/bingoSocket';
+import { BingoRoomSnapshot, BingoSocket, connectBingoSocket, emitBingoWithAck, BingoJoinResult, BingoClaimResult, GLOBAL_BINGO_ROOM_ID } from './utils/bingoSocket';
+import { clearLegacyLocalRoomId } from './utils/roomStorage';
+import { getBingoGuestSession, syncUserRegistration } from './utils/api';
 
 const STORAGE_KEY = 'salery_bingo_user_profile';
 const HISTORY_KEY = 'salery_bingo_game_history';
+
+function readStoredRoomTicket() {
+  if (typeof window === 'undefined') {
+    return { joined: false, requested: false, cardIds: [] as number[], walletType: 'main_wallet' as const, joinRequestId: null as string | null };
+  }
+  try {
+    const storedCardIds = JSON.parse(localStorage.getItem('salery_bingo_room_card_ids') || '[]');
+    return {
+      joined: localStorage.getItem('salery_bingo_has_joined_room_once') === 'true',
+      requested: localStorage.getItem('salery_bingo_active_room_requested') === 'true',
+      cardIds: Array.isArray(storedCardIds)
+        ? storedCardIds.filter((id): id is number => Number.isInteger(id) && id >= 1 && id <= 400)
+        : [],
+      walletType: localStorage.getItem('salery_bingo_room_wallet_type') === 'play_wallet' ? 'play_wallet' as const : 'main_wallet' as const,
+      joinRequestId: localStorage.getItem('salery_bingo_room_join_request_id'),
+    };
+  } catch (error) {
+    console.error('Could not restore the saved bingo ticket:', error);
+    return { joined: false, requested: false, cardIds: [] as number[], walletType: 'main_wallet' as const, joinRequestId: null as string | null };
+  }
+}
 
 export function checkIsAdminRoute(): boolean {
   if (typeof window === 'undefined') return false;
@@ -134,17 +153,22 @@ export default function App() {
   const [user, setUser] = useState<UserProfile>(() => {
     let persistentId = 1000000001;
     if (typeof window !== 'undefined') {
-      const storedMockId = localStorage.getItem('salery_bingo_mock_tg_id') || localStorage.getItem('salery_bingo_unique_id');
-      if (storedMockId && !Number.isNaN(Number(storedMockId))) {
-        persistentId = Number(storedMockId);
+      const storedPlayerId = localStorage.getItem('salery_bingo_player_id') || localStorage.getItem('salery_bingo_unique_id');
+      const parsedPlayerId = Number(storedPlayerId);
+      if (storedPlayerId && Number.isSafeInteger(parsedPlayerId) && parsedPlayerId > 0) {
+        persistentId = parsedPlayerId;
       } else {
-        persistentId = Math.floor(100000000 + Math.random() * 900000000);
+        const randomValues = new Uint32Array(2);
+        crypto.getRandomValues(randomValues);
+        const randomValue = (randomValues[0] & 0x001fffff) * 0x100000000 + randomValues[1];
+        persistentId = 1000000000000000 + (randomValue % 8000000000000000);
         localStorage.setItem('salery_bingo_unique_id', String(persistentId));
-        localStorage.setItem('salery_bingo_mock_tg_id', String(persistentId));
       }
+      localStorage.setItem('salery_bingo_player_id', String(persistentId));
     }
 
     const defaultPlayerCode = `SB-${((Math.abs(persistentId) * 17) % 90000) + 10000}`;
+    const defaultBalance = 0;
 
     let initialProfile: UserProfile = {
       telegramId: persistentId,
@@ -152,9 +176,10 @@ export default function App() {
       username: `player_${String(persistentId).slice(-4)}`,
       playerCode: defaultPlayerCode,
       phoneNumber: '',
-      balance: 100,
-      mainWallet: 100,
-      playWallet: 10, // Register Bonus
+      balance: defaultBalance,
+      mainWallet: defaultBalance,
+      playWallet: 0,
+      shareBonusAwarded: false,
       role: 'user',
       status: 'active',
       is_blocked: false,
@@ -170,10 +195,18 @@ export default function App() {
         initialProfile = {
           ...initialProfile,
           ...parsed,
-          playerCode: parsed.playerCode || defaultPlayerCode,
-          balance: parsed.mainWallet ?? parsed.balance ?? 100,
-          mainWallet: parsed.mainWallet ?? parsed.balance ?? 100,
-          playWallet: parsed.playWallet ?? 10
+          telegramId: persistentId,
+          firstName: 'Player',
+          username: `player_${String(persistentId).slice(-4)}`,
+          playerCode: defaultPlayerCode,
+          balance: 0,
+          mainWallet: 0,
+          playWallet: 0,
+          shareBonusAwarded: parsed.shareBonusAwarded ?? false,
+          role: 'user',
+          status: 'active',
+          is_blocked: false,
+          ban_reason: undefined,
         };
       } catch {}
     }
@@ -182,210 +215,24 @@ export default function App() {
 
   const [isRefreshingBalance, setIsRefreshingBalance] = useState(false);
 
-  // Fetch updated user stats and game history from PostgreSQL or Supabase
-  const refreshUserData = useCallback(async (targetId?: number) => {
-    const fetchId = targetId || user.telegramId;
-    if (!fetchId) return;
+  const refreshUserData = useCallback(async () => {
     setIsRefreshingBalance(true);
     try {
-      const res = await fetchUserProfile(fetchId);
-      if (res && res.ok) {
-        const pCode = res.user?.playerCode || ('SB-' + (((Math.abs(Number(fetchId)) * 17) % 90000) + 10000));
-        setUser((prev) => ({
-          ...prev,
-          telegramId: Number(fetchId),
-          balance: res.balance,
-          mainWallet: res.mainWallet ?? res.balance,
-          playWallet: res.playWallet ?? prev.playWallet ?? 0,
-          phoneNumber: res.phoneNumber || prev.phoneNumber,
-          firstName: res.user?.firstName || prev.firstName,
-          username: res.user?.username || prev.username,
-          playerCode: pCode,
-          role: res.user?.role || prev.role,
-          status: res.status || (res.isBlocked ? 'blocked' : 'active'),
-          is_blocked: res.isBlocked || false,
-          ban_reason: res.ban_reason,
-        }));
-      }
-
-      // Sync game history from server
-      const historyRes = await fetchPlayerGameHistory(fetchId);
-      if (historyRes && historyRes.ok && Array.isArray(historyRes.history) && historyRes.history.length > 0) {
-        setHistory((prevHistory) => {
-          const map = new Map<string, GameHistoryItem>();
-          historyRes.history.forEach((h: any) => {
-            const item: GameHistoryItem = {
-              id: h.id || `gm-${h.timestamp}`,
-              timestamp: typeof h.timestamp === 'number' ? h.timestamp : new Date(h.created_at || h.timestamp).getTime(),
-              stake: Number(h.stake) || 10,
-              cardsCount: Number(h.cards_count || h.cardsCount) || 1,
-              result: h.result === 'won' ? 'won' : 'lost',
-              wonAmount: Number(h.won_amount || h.wonAmount) || 0,
-              patternName: h.pattern_name || h.patternName || '1 Line',
-              gameCode: h.game_code || h.gameCode,
-              totalPrize: Number(h.total_prize || h.totalPrize) || Number(h.won_amount || h.wonAmount) || 0,
-              winnersCount: 1,
-            };
-            map.set(item.id, item);
-          });
-          prevHistory.forEach((item) => map.set(item.id, item));
-          return Array.from(map.values()).sort((a, b) => b.timestamp - a.timestamp);
-        });
-      }
+      const session = await getBingoGuestSession();
+      setUser((previous) => ({
+        ...previous,
+        telegramId: session.playerId,
+        balance: session.mainWallet,
+        mainWallet: session.mainWallet,
+        playWallet: session.playWallet,
+        playerCode: session.playerCode || previous.playerCode,
+      }));
+    } catch (error) {
+      console.error('Could not refresh the server-authoritative wallet balance:', error);
     } finally {
       setIsRefreshingBalance(false);
     }
-  }, [user.telegramId]);
-
-  const bootstrappedRef = useRef(false);
-  const telegramInitDataRef = useRef('');
-
-  // Initial user extraction and Supabase fetch with retries
-  useEffect(() => {
-    if (bootstrappedRef.current) return;
-    bootstrappedRef.current = true;
-
-    const detectAndFetchUser = () => {
-      let resolvedId: number | null = null;
-      let resolvedFirstName = '';
-      let resolvedUsername = '';
-
-      if (typeof window !== 'undefined') {
-        const params = new URLSearchParams(window.location.search);
-        const qId =
-          params.get('user_id') ||
-          params.get('id') ||
-          params.get('telegram_id') ||
-          params.get('tgWebAppStartParam');
-        if (qId && !isNaN(Number(qId)) && Number(qId) !== 1234567) {
-          resolvedId = Number(qId);
-        }
-
-        const tg = (window as any).Telegram?.WebApp;
-        if (tg) {
-          if (typeof tg.initData === 'string') telegramInitDataRef.current = tg.initData;
-          try {
-            tg.ready();
-            tg.expand();
-          } catch {}
-          if (tg.initDataUnsafe?.user?.id) {
-            resolvedId = tg.initDataUnsafe.user.id;
-            resolvedFirstName = tg.initDataUnsafe.user.first_name || '';
-            resolvedUsername = tg.initDataUnsafe.user.username || '';
-          }
-        }
-
-        if (!resolvedId && window.location.hash) {
-          try {
-            const hashParams = new URLSearchParams(window.location.hash.slice(1));
-            const tgData = hashParams.get('tgWebAppData');
-            if (tgData) {
-              telegramInitDataRef.current = tgData;
-              const parsed = new URLSearchParams(tgData);
-              const uStr = parsed.get('user');
-              if (uStr) {
-                const u = JSON.parse(uStr);
-                if (u.id) {
-                  resolvedId = Number(u.id);
-                  resolvedFirstName = u.first_name || '';
-                  resolvedUsername = u.username || '';
-                }
-              }
-            }
-          } catch {}
-        }
-      }
-
-      const finalId = resolvedId || user.telegramId;
-      const finalFirstName = resolvedFirstName || user.firstName;
-      const finalUsername = resolvedUsername || user.username;
-      const finalPlayerCode = user.playerCode || (`SB-${((Math.abs(Number(finalId)) * 17) % 90000) + 10000}`);
-
-      const syncedUser = {
-        ...user,
-        telegramId: finalId,
-        firstName: finalFirstName,
-        username: finalUsername,
-        playerCode: finalPlayerCode,
-      };
-
-      setUser(syncedUser);
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(syncedUser));
-
-      // Register and load balance from server database
-      void syncUserRegistration(syncedUser).then((res) => {
-        if (res && res.ok) {
-          const r = res as any;
-          const assignedCode = r.user?.playerCode || r.user?.player_code || finalPlayerCode;
-          setUser((prev) => ({
-            ...prev,
-            balance: r.balance,
-            mainWallet: r.mainWallet ?? r.balance,
-            playWallet: r.playWallet ?? prev.playWallet ?? 0,
-            phoneNumber: r.phoneNumber || prev.phoneNumber,
-            role: r.user?.role || prev.role,
-            playerCode: assignedCode,
-            status: r.status || (r.isBlocked ? 'blocked' : 'active'),
-            is_blocked: r.isBlocked || false,
-            ban_reason: r.ban_reason,
-          }));
-
-          // Fetch real server game history on start
-          void fetchPlayerGameHistory(finalId).then((historyRes) => {
-            if (historyRes && historyRes.ok && Array.isArray(historyRes.history) && historyRes.history.length > 0) {
-              setHistory((prevHistory) => {
-                const map = new Map<string, GameHistoryItem>();
-                historyRes.history.forEach((h: any) => {
-                  const item: GameHistoryItem = {
-                    id: h.id || `gm-${h.timestamp}`,
-                    timestamp: typeof h.timestamp === 'number' ? h.timestamp : new Date(h.created_at || h.timestamp).getTime(),
-                    stake: Number(h.stake) || 10,
-                    cardsCount: Number(h.cards_count || h.cardsCount) || 1,
-                    result: h.result === 'won' ? 'won' : 'lost',
-                    wonAmount: Number(h.won_amount || h.wonAmount) || 0,
-                    patternName: h.pattern_name || h.patternName || '1 Line',
-                    gameCode: h.game_code || h.gameCode,
-                    totalPrize: Number(h.total_prize || h.totalPrize) || Number(h.won_amount || h.wonAmount) || 0,
-                    winnersCount: 1,
-                  };
-                  map.set(item.id, item);
-                });
-                prevHistory.forEach((item) => map.set(item.id, item));
-                return Array.from(map.values()).sort((a, b) => b.timestamp - a.timestamp);
-              });
-            }
-          });
-        }
-      });
-    };
-
-    detectAndFetchUser();
   }, []);
-
-  // Sync Supabase status changes in real-time
-  useEffect(() => {
-    if (!user.telegramId) return;
-    const unsub = subscribeToSupabaseTable('users', (payload) => {
-      const record = payload.new;
-      if (record && Number(record.telegram_id) === Number(user.telegramId)) {
-        setUser((prev) => ({
-          ...prev,
-          balance: record.balance,
-          mainWallet: record.main_wallet ?? record.balance,
-          playWallet: record.play_wallet ?? prev.playWallet ?? 0,
-          phoneNumber: record.phone_number || prev.phoneNumber,
-          firstName: record.first_name || prev.firstName,
-          username: record.username || prev.username,
-          status: record.status || 'active',
-          is_blocked: record.status === 'blocked',
-          ban_reason: record.ban_reason,
-        }));
-      }
-    });
-    return () => {
-      unsub();
-    };
-  }, [user.telegramId]);
 
   // 2. Game History State
   const [history, setHistory] = useState<GameHistoryItem[]>(() => {
@@ -426,16 +273,14 @@ export default function App() {
 
   // 4. Game Engine State
   const [status, setStatus] = useState<GameStatus>('idle');
+  const [isSpectator, setIsSpectator] = useState(false);
   const [countdown, setCountdown] = useState<number>(3);
   const [currentBall, setCurrentBall] = useState<BingoBall | null>(null);
   const [calledBalls, setCalledBalls] = useState<BingoBall[]>([]);
   const [calledSet, setCalledSet] = useState<Set<number>>(new Set());
   const [cards, setCards] = useState<BingoCardModel[]>([]);
-  const [competitors, setCompetitors] = useState<CompetitorPlayer[]>([]);
-  const [activeRoomPlayers, setActiveRoomPlayers] = useState<number>(0);
-  const [activeRoomCartelas, setActiveRoomCartelas] = useState<number>(0);
   const [prizePool, setPrizePool] = useState<number>(0);
-  const [activeGameId, setActiveGameId] = useState('');
+  const [activeGameId, setActiveGameId] = useState(GLOBAL_BINGO_ROOM_ID);
   const [roomStartsAt, setRoomStartsAt] = useState<number>(0);
   const [roomPlayers, setRoomPlayers] = useState<Array<{ name: string; cardsCount: number; isOnline?: boolean }>>([]);
 
@@ -459,37 +304,37 @@ export default function App() {
   const t = translations[settings.language];
   const [socketInstance, setSocketInstance] = useState<BingoSocket | null>(null);
   const gameSocketRef = useRef<BingoSocket | null>(null);
-  const activeRoomRequestedRef = useRef<boolean>(
-    typeof window !== 'undefined' ? localStorage.getItem('salery_bingo_active_room_requested') === 'true' : false
-  );
-  const hasJoinedRoomOnceRef = useRef<boolean>(
-    typeof window !== 'undefined' ? localStorage.getItem('salery_bingo_has_joined_room_once') === 'true' : false
-  );
-  const roomCardIdsRef = useRef<number[]>(
-    (() => {
-      if (typeof window === 'undefined') return [];
-      try {
-        const stored = localStorage.getItem('salery_bingo_room_card_ids');
-        return stored ? JSON.parse(stored) : [];
-      } catch { return []; }
-    })()
-  );
-  const roomWalletTypeRef = useRef<'main_wallet' | 'play_wallet'>(
-    typeof window !== 'undefined' ? (localStorage.getItem('salery_bingo_room_wallet_type') as 'main_wallet' | 'play_wallet') || 'main_wallet' : 'main_wallet'
-  );
-  const roomJoinRequestIdRef = useRef<string | null>(
-    typeof window !== 'undefined' ? localStorage.getItem('salery_bingo_room_join_request_id') : null
-  );
-  const currentTelegramIdRef = useRef(user.telegramId);
+  const storedRoomTicket = readStoredRoomTicket();
+  const activeRoomRequestedRef = useRef(storedRoomTicket.requested && storedRoomTicket.cardIds.length > 0);
+  const hasJoinedRoomOnceRef = useRef(storedRoomTicket.joined && storedRoomTicket.cardIds.length > 0);
+  const roomCardIdsRef = useRef(storedRoomTicket.cardIds);
+  const roomWalletTypeRef = useRef<'main_wallet' | 'play_wallet'>(storedRoomTicket.walletType);
+  const roomJoinRequestIdRef = useRef<string | null>(storedRoomTicket.joinRequestId);
+  const currentPlayerIdRef = useRef(user.telegramId);
   const settingsRef = useRef(settings);
   const lastCalledNumberRef = useRef<number | null>(null);
-  const lastBallDrawnTimestampRef = useRef<number>(0);
+  const lastReceivedDrawRef = useRef<string | null>(null);
   const hasPlayedBingoAudioThisRoundRef = useRef(false);
+  const lastCreditedWinnerGameIdRef = useRef<string | null>(null);
   const statusRef = useRef(status);
   statusRef.current = status;
   settingsRef.current = settings;
-  currentTelegramIdRef.current = user.telegramId;
+  currentPlayerIdRef.current = user.telegramId;
   const handleClaimBingoRef = useRef<((card: BingoCardModel) => void) | null>(null);
+
+  useEffect(() => {
+    clearLegacyLocalRoomId();
+  }, []);
+
+  useEffect(() => {
+    void syncUserRegistration().then((result) => {
+      if (result.ok) {
+        console.info('Telegram Mini App user profile synchronized.');
+      }
+    }).catch((error: unknown) => {
+      console.error('Could not synchronize the Telegram Mini App user profile:', error);
+    });
+  }, []);
 
   const showToast = (msg: string) => {
     setToastMessage(msg);
@@ -503,7 +348,6 @@ export default function App() {
       newCards.push(generateBingoCard(i));
     }
     setCards(newCards);
-    setCompetitors([]);
   }, []);
 
   useEffect(() => {
@@ -575,7 +419,34 @@ export default function App() {
     win?: WinValidationResult;
   }) => {
     const gameId = payload.gameId || activeGameId;
+    const isWinner = Boolean(payload.winnerId && String(payload.winnerId) === String(currentPlayerIdRef.current));
+    const hasAuthoritativeWallet =
+      typeof payload.balance === 'number' &&
+      Number.isFinite(payload.balance) &&
+      typeof payload.mainWallet === 'number' &&
+      Number.isFinite(payload.mainWallet);
     if (gameId && lastProcessedWinnerGameIdRef.current === gameId) {
+      if (isWinner && hasAuthoritativeWallet && lastCreditedWinnerGameIdRef.current !== gameId) {
+        lastCreditedWinnerGameIdRef.current = gameId;
+        const prize = payload.prize ?? prizePool;
+        setUser((previous) => ({
+          ...previous,
+          balance: payload.balance!,
+          mainWallet: payload.mainWallet!,
+          playWallet: payload.playWallet ?? previous.playWallet ?? 0,
+          totalWins: previous.totalWins + 1,
+          totalWonAmount: previous.totalWonAmount + prize,
+        }));
+        setHistory((previous) => previous.some((entry) => entry.id === `game-${gameId}`) ? previous : [{
+          id: `game-${gameId}`,
+          timestamp: Date.now(),
+          stake: settingsRef.current.selectedStake,
+          cardsCount: settingsRef.current.cardsCount,
+          result: 'won',
+          wonAmount: prize,
+          patternName: payload.win?.patternName || 'Bingo Win',
+        }, ...previous]);
+      }
       return;
     }
     lastProcessedWinnerGameIdRef.current = gameId || 'game-finished';
@@ -585,7 +456,6 @@ export default function App() {
     setStatus('game_over');
     sounds.stopAllAudio();
 
-    const isWinner = !payload.winnerId || String(payload.winnerId) === String(currentTelegramIdRef.current);
     const winDetails = payload.win || {
       hasWon: true,
       patternType: 'line',
@@ -604,18 +474,19 @@ export default function App() {
       prize: finalPrize,
       isMe: isWinner,
     });
-    setShowWinModal(isWinner);
+    setShowWinModal(Boolean(payload.winnerId));
 
     activeRoomRequestedRef.current = false;
     hasJoinedRoomOnceRef.current = false;
     roomJoinRequestIdRef.current = null;
+    setIsSpectator(false);
     if (typeof window !== 'undefined') {
       localStorage.removeItem('salery_bingo_has_joined_room_once');
       localStorage.removeItem('salery_bingo_active_room_requested');
       localStorage.removeItem('salery_bingo_room_card_ids');
       localStorage.removeItem('salery_bingo_room_wallet_type');
       localStorage.removeItem('salery_bingo_room_join_request_id');
-      localStorage.removeItem(`salery_bingo_pending_room_${currentTelegramIdRef.current}`);
+      localStorage.removeItem(`salery_bingo_pending_room_${currentPlayerIdRef.current}`);
     }
 
     if (isWinner) {
@@ -623,14 +494,17 @@ export default function App() {
         hasPlayedBingoAudioThisRoundRef.current = true;
         sounds.playBingo();
       }
-      setUser((previous) => ({
-        ...previous,
-        balance: typeof payload.balance === 'number' ? payload.balance : previous.balance + finalPrize,
-        mainWallet: typeof payload.mainWallet === 'number' ? payload.mainWallet : previous.mainWallet + finalPrize,
-        playWallet: typeof payload.playWallet === 'number' ? payload.playWallet : previous.playWallet ?? 0,
-        totalWins: previous.totalWins + 1,
-        totalWonAmount: previous.totalWonAmount + finalPrize,
-      }));
+      if (hasAuthoritativeWallet && lastCreditedWinnerGameIdRef.current !== gameId) {
+        lastCreditedWinnerGameIdRef.current = gameId || 'game-finished';
+        setUser((previous) => ({
+          ...previous,
+          balance: payload.balance!,
+          mainWallet: payload.mainWallet!,
+          playWallet: payload.playWallet ?? previous.playWallet ?? 0,
+          totalWins: previous.totalWins + 1,
+          totalWonAmount: previous.totalWonAmount + finalPrize,
+        }));
+      }
 
       if (payload.cardId) {
         setCards((previous) => previous.map((card) => card.cardIndex !== payload.cardId ? card : ({
@@ -644,32 +518,19 @@ export default function App() {
         })));
       }
 
-      logGameHistory(user.telegramId, {
-        stake: settingsRef.current.selectedStake,
-        cardsCount: settingsRef.current.cardsCount,
-        result: 'won',
-        wonAmount: finalPrize,
-        patternName: winDetails.patternName,
-        gameCode: gameId,
-      });
-      setHistory((previous) => [{
-        id: `game-${gameId}`,
-        timestamp: Date.now(),
-        stake: settingsRef.current.selectedStake,
-        cardsCount: settingsRef.current.cardsCount,
-        result: 'won',
-        wonAmount: finalPrize,
-        patternName: winDetails.patternName,
-      }, ...previous]);
+      if (hasAuthoritativeWallet) {
+        setHistory((previous) => [{
+          id: `game-${gameId}`,
+          timestamp: Date.now(),
+          stake: settingsRef.current.selectedStake,
+          cardsCount: settingsRef.current.cardsCount,
+          result: 'won',
+          wonAmount: finalPrize,
+          patternName: winDetails.patternName,
+        }, ...previous]);
+      }
     } else {
       sounds.playBeep(false);
-      logGameHistory(user.telegramId, {
-        stake: settingsRef.current.selectedStake,
-        cardsCount: settingsRef.current.cardsCount,
-        result: 'lost',
-        wonAmount: 0,
-        gameCode: gameId,
-      });
       if (payload.winnerName) {
         showToast(`🏆 ጨዋታው ተጠናቋል! አሸናፊ: ${payload.winnerName}`);
       }
@@ -691,9 +552,7 @@ export default function App() {
     setCalledSet(calledNumbers);
     setCurrentBall(newestBall);
     setPrizePool(room.prizePool);
-    setActiveRoomPlayers(room.playerCount);
     setRoomPlayers(room.players);
-    setActiveRoomCartelas(room.players.reduce((total, player) => total + player.cardsCount, 0));
     setActiveGameId(room.gameId);
     if (typeof room.startsAt === 'number' && room.startsAt > 0) {
       setRoomStartsAt(room.startsAt);
@@ -719,7 +578,7 @@ export default function App() {
         gameId: room.gameId,
         winnerId: room.winnerId,
         winnerName: room.winnerName,
-        cardId: room.winningCardId || 1,
+        cardId: room.winningCardId,
         prize: room.prize || room.prizePool,
       });
     } else if (room.status === 'in_progress') {
@@ -731,6 +590,7 @@ export default function App() {
         setStatus('in_progress');
       }
     } else if (room.status === 'waiting') {
+      setIsSpectator(false);
       setWinnerInfo(null);
       setShowWinModal(false);
       setWinResult(null);
@@ -771,30 +631,20 @@ export default function App() {
       return;
     }
 
-    const fallbackWin = () => {
-      handleProcessWinner({
-        gameId: activeGameId || `game-${Date.now()}`,
-        winnerId: String(user.telegramId),
-        winnerName: user.firstName || user.username || 'You',
-        cardId: winningCard.cardIndex,
-        prize: Math.max(prizePool, Math.floor(Math.max(cards.length, 1) * settings.selectedStake * 0.8)),
-        win,
-      });
-      claimInFlightRef.current = false;
-    };
-
     const socket = gameSocketRef.current;
     if (!socket?.connected) {
-      fallbackWin();
+      claimInFlightRef.current = false;
+      showToast('Could not verify Bingo with the server. Your wallet was not changed.');
       return;
     }
 
-    // Safety timeout: if server doesn't respond within 1.5s, declare victory immediately!
+    // Release the claim lock if the server fails to respond; never settle a win locally.
     const safetyTimer = setTimeout(() => {
       if (statusRef.current === 'in_progress') {
-        fallbackWin();
+        claimInFlightRef.current = false;
+        showToast('Bingo verification timed out. Your wallet was not changed.');
       }
-    }, 1500);
+    }, 10_000);
 
     try {
       socket.emit('room:claim', { cardId: winningCard.cardIndex, stake: settings.selectedStake }, (ackRes: any) => {
@@ -805,20 +655,22 @@ export default function App() {
             winnerId: String(user.telegramId),
             winnerName: user.firstName || user.username || 'You',
             cardId: winningCard.cardIndex,
-            prize: ackRes.balance || ackRes.state?.prize || prizePool,
+            prize: ackRes.state?.prize ?? prizePool,
             balance: ackRes.balance,
             mainWallet: ackRes.mainWallet,
             playWallet: ackRes.playWallet,
             win: ackRes.win || win,
           });
         } else {
-          console.warn('Server claim rejected, applying local verified win:', ackRes?.error);
-          fallbackWin();
+          claimInFlightRef.current = false;
+          showToast(ackRes?.error || 'The server could not verify Bingo.');
         }
       });
-    } catch {
+    } catch (error) {
       clearTimeout(safetyTimer);
-      fallbackWin();
+      claimInFlightRef.current = false;
+      console.error('Could not submit Bingo claim:', error);
+      showToast('Could not verify Bingo with the server. Your wallet was not changed.');
     }
   }, [settings.language, settings.selectedStake, activeGameId, user.telegramId, user.firstName, user.username, prizePool, cards.length, handleProcessWinner]);
 
@@ -841,27 +693,28 @@ export default function App() {
 
 
   const getOrCreateSocket = useCallback(() => {
-    let initData = telegramInitDataRef.current;
-    if (!initData && typeof window !== 'undefined') {
-      initData = new URLSearchParams(window.location.hash.slice(1)).get('tgWebAppData') || '';
-      if (!initData) {
-        const hostname = window.location.hostname;
-        const isLocal = hostname === 'localhost' || hostname === '127.0.0.1';
-        if (isLocal || process.env.NODE_ENV !== 'production') {
-          const existing = localStorage.getItem('salery_bingo_mock_tg_id');
-          const nextId = existing && !Number.isNaN(Number(existing)) ? String(existing) : String(Math.floor(100000000 + Math.random() * 900000000));
-          localStorage.setItem('salery_bingo_mock_tg_id', nextId);
-          initData = `mock:${nextId}`;
-        }
-      }
-      telegramInitDataRef.current = initData;
-    }
-
     let socket = gameSocketRef.current;
     if (!socket) {
-      socket = connectBingoSocket(initData);
+      socket = connectBingoSocket(user.telegramId, (session) => {
+        setUser((previous) => ({
+          ...previous,
+          telegramId: session.playerId,
+          balance: session.mainWallet,
+          mainWallet: session.mainWallet,
+          playWallet: session.playWallet,
+          playerCode: session.playerCode || previous.playerCode,
+        }));
+      });
+      socket.on('connect', () => {
+        console.log('[SOCKET] Connected:', socket.id);
+      });
       socket.on('room:state', applyRoomSnapshot);
+      socket.on('admin:broadcast', (payload: { message?: string; photoUrl?: string }) => {
+        const message = typeof payload?.message === 'string' ? payload.message.trim() : '';
+        showToast(message || (payload?.photoUrl ? 'New Salery Bingo announcement' : 'New system notification'));
+      });
       socket.on('gameStarted', ({ gameId, startedAt }) => {
+        if (!activeRoomRequestedRef.current || roomCardIdsRef.current.length === 0) return;
         setActiveGameId(gameId || activeGameId);
         setCountdown(0);
         setStatus('in_progress');
@@ -872,18 +725,32 @@ export default function App() {
           }
         }
       });
-      socket.on('numberDrawn', ({ number, called, gameId }) => {
+      socket.on('room:number_drawn', (payload) => {
+        console.log('[SOCKET] Received room:number_drawn:', payload);
+        const number = typeof payload?.ball?.number === 'number'
+          ? payload.ball.number
+          : payload?.number;
+        const calledNumbers = Array.isArray(payload?.calledNumbers)
+          ? payload.calledNumbers
+          : payload?.called;
+        const gameId = payload?.gameId || payload?.ball?.gameId;
         if (!number) return;
+        if (!activeRoomRequestedRef.current || roomCardIdsRef.current.length === 0) return;
         if (statusRef.current === 'game_over') return;
+        const drawId = `${gameId || ''}:${number}:${payload?.drawnAt ?? payload?.ball?.drawnAt ?? ''}`;
+        if (lastReceivedDrawRef.current === drawId) return;
+        lastReceivedDrawRef.current = drawId;
 
+        if (statusRef.current === 'starting') {
+          statusRef.current = 'in_progress';
+          setStatus('in_progress');
+        }
         const ball = { number, letter: getLetterForNumber(number), id: `ball-${number}` };
-        lastBallDrawnTimestampRef.current = Date.now();
         setCurrentBall(ball);
         setActiveGameId(gameId || activeGameId);
 
-        const nextCalledList: number[] = Array.isArray(called) && called.length > 0 ? called : [number];
+        const nextCalledList: number[] = Array.isArray(calledNumbers) ? calledNumbers : [number];
         const nextSet = new Set(nextCalledList);
-        nextSet.add(number);
         setCalledSet(nextSet);
         setCalledBalls(Array.from(nextSet).reverse().map((n: number) => ({
           number: n,
@@ -932,25 +799,60 @@ export default function App() {
           sounds.playCalledNumber({ letter: ball.letter, number: ball.number });
         }
       });
-      socket.on('connect', () => {
+      const rejoinRoom = () => {
         if (!hasJoinedRoomOnceRef.current || !activeRoomRequestedRef.current) return;
         void emitBingoWithAck<BingoJoinResult>(socket!, 'room:join', {
           stake: settingsRef.current.selectedStake,
+          roomId: GLOBAL_BINGO_ROOM_ID,
           cardIds: roomCardIdsRef.current,
           joinRequestId: roomJoinRequestIdRef.current,
           walletType: roomWalletTypeRef.current,
-        }).then((rejoined) => {
-          if (!rejoined.ok || !rejoined.state || !rejoined.cards) {
+          rejoin: true,
+        }, 0).then((rejoined) => {
+          if (rejoined.spectator && rejoined.state) {
+            setIsSpectator(true);
             activeRoomRequestedRef.current = false;
             hasJoinedRoomOnceRef.current = false;
-            localStorage.removeItem('salery_bingo_has_joined_room_once');
-            localStorage.removeItem('salery_bingo_active_room_requested');
-            localStorage.removeItem('salery_bingo_room_card_ids');
-            localStorage.removeItem('salery_bingo_room_wallet_type');
-            localStorage.removeItem('salery_bingo_room_join_request_id');
-            setStatus('idle');
+            roomCardIdsRef.current = [];
+            setCards([]);
+            applyRoomSnapshot(rejoined.state);
+            setActiveTab('game');
+            setStatus(rejoined.state.status === 'finished' ? 'game_over' : 'in_progress');
             return;
           }
+          if (!rejoined.ok || !rejoined.state || !rejoined.cards) {
+            console.error('Could not restore the bingo room after reconnecting:', rejoined.error);
+            if (rejoined.error?.includes('No active cartela ticket')) {
+              activeRoomRequestedRef.current = false;
+              hasJoinedRoomOnceRef.current = false;
+              roomCardIdsRef.current = [];
+              roomJoinRequestIdRef.current = null;
+              localStorage.removeItem('salery_bingo_has_joined_room_once');
+              localStorage.removeItem('salery_bingo_active_room_requested');
+              localStorage.removeItem('salery_bingo_room_card_ids');
+              localStorage.removeItem('salery_bingo_room_wallet_type');
+              localStorage.removeItem('salery_bingo_room_join_request_id');
+              socket!.emit('cartela:room_enter', {
+                roomId: GLOBAL_BINGO_ROOM_ID,
+                stake: settingsRef.current.selectedStake,
+              }, (roomEntry: any) => {
+                if (roomEntry?.ok && roomEntry.state?.status === 'in_progress') {
+                  setIsSpectator(true);
+                  setCards([]);
+                  applyRoomSnapshot(roomEntry.state);
+                  setActiveTab('game');
+                  setStatus('in_progress');
+                } else {
+                  setIsSpectator(false);
+                  setStatus('cartela_select');
+                }
+              });
+            } else {
+              showToast(rejoined.error || 'Could not restore the bingo room. Please try again.');
+            }
+            return;
+          }
+          setIsSpectator(false);
           // Preserve existing marks so they NEVER disappear!
           setCards((currentCards) => {
             const calledNums = new Set(rejoined.state?.called || []);
@@ -992,8 +894,17 @@ export default function App() {
             }));
           }
           applyRoomSnapshot(rejoined.state);
-        }).catch(() => showToast('Reconnecting to the bingo room...'));
-      });
+          setStatus(
+            rejoined.state.status === 'in_progress'
+              ? 'in_progress'
+              : rejoined.state.status === 'finished' ? 'game_over' : 'starting'
+          );
+        }).catch((error: unknown) => {
+          console.error('Could not restore the bingo room after reconnecting:', error);
+          showToast('Could not restore the bingo room. Reconnecting...');
+        });
+      };
+      socket.on('connect', rejoinRoom);
       socket.on('wallet:balance', (wallets: number | { balance?: number; mainWallet?: number; playWallet?: number }) => {
         const balance = typeof wallets === 'number' ? wallets : wallets.mainWallet ?? wallets.balance;
         if (typeof balance === 'number' && Number.isFinite(balance)) {
@@ -1013,16 +924,15 @@ export default function App() {
       });
       gameSocketRef.current = socket;
       setSocketInstance(socket);
+      socket.connect();
     }
     return socket;
   }, [applyRoomSnapshot, handleProcessWinner, user.telegramId]);
 
-  // Auto-connect and try to rejoin on startup if in an active online game
+  // Keep a socket connected so open clients receive live admin announcements.
   useEffect(() => {
-    if (activeRoomRequestedRef.current) {
-      getOrCreateSocket();
-    }
-  }, []);
+    getOrCreateSocket();
+  }, [getOrCreateSocket]);
 
   // Real-time synchronized ball calling loop when in progress
   useEffect(() => {
@@ -1047,8 +957,8 @@ export default function App() {
     }
 
     const interval = setInterval(() => {
-      // If socket is actively connected and drawing balls, yield to socket
-      if (gameSocketRef.current?.connected && Date.now() - (lastBallDrawnTimestampRef.current || 0) < 3500) {
+      // A connected room uses the server's draw events as its only source of called numbers.
+      if (gameSocketRef.current?.connected && activeRoomRequestedRef.current) {
         return;
       }
 
@@ -1073,7 +983,6 @@ export default function App() {
       if (!number) return;
 
       const ball = { number, letter: getLetterForNumber(number), id: `ball-${number}` };
-      lastBallDrawnTimestampRef.current = Date.now();
       setCurrentBall(ball);
       setCalledSet((prev) => {
         const next = new Set(prev);
@@ -1126,24 +1035,98 @@ export default function App() {
     roomCardIdsRef.current = [];
     hasJoinedRoomOnceRef.current = false;
     activeRoomRequestedRef.current = false;
+    setIsSpectator(false);
     setStatus('cartela_select');
 
     const socket = getOrCreateSocket();
-    socket.emit('cartela:room_enter', { stake: settings.selectedStake }, (res: any) => {
+    socket.emit('cartela:room_enter', { roomId: GLOBAL_BINGO_ROOM_ID, stake: settings.selectedStake }, (res: any) => {
       if (res && res.ok && res.state) {
         if (typeof res.state.startsAt === 'number' && res.state.startsAt > Date.now()) {
           setRoomStartsAt(res.state.startsAt);
         }
-        // If the user already joined with cards and reloaded, resume that game
-        if (res.state.status === 'in_progress' && res.joinedPlayer?.cardIds?.length > 0) {
-          const joinedCards = res.joinedPlayer.cardIds.map((id: number) => generateCartelaByNumber(id));
-          setCards(joinedCards);
-          roomCardIdsRef.current = res.joinedPlayer.cardIds;
-          hasJoinedRoomOnceRef.current = true;
-          activeRoomRequestedRef.current = true;
-          setStatus('in_progress');
+        const ticketCardIds = res.joinedPlayer?.cardIds;
+        if (res.state.status === 'in_progress') {
+          if (Array.isArray(ticketCardIds) && ticketCardIds.length > 0) {
+            const ticketIds = ticketCardIds.filter((id: number) => Number.isInteger(id) && id >= 1 && id <= 400);
+            if (ticketIds.length > 0) {
+              const walletType = res.joinedPlayer.walletType === 'play_wallet' ? 'play_wallet' : 'main_wallet';
+              const joinRequestId = localStorage.getItem('salery_bingo_room_join_request_id');
+              roomCardIdsRef.current = ticketIds;
+              roomWalletTypeRef.current = walletType;
+              roomJoinRequestIdRef.current = joinRequestId;
+              hasJoinedRoomOnceRef.current = true;
+              activeRoomRequestedRef.current = true;
+              localStorage.setItem('salery_bingo_has_joined_room_once', 'true');
+              localStorage.setItem('salery_bingo_active_room_requested', 'true');
+              localStorage.setItem('salery_bingo_room_card_ids', JSON.stringify(ticketIds));
+              localStorage.setItem('salery_bingo_room_wallet_type', walletType);
+              void emitBingoWithAck<BingoJoinResult>(socket, 'room:join', {
+                roomId: GLOBAL_BINGO_ROOM_ID,
+                stake: settingsRef.current.selectedStake,
+                cardIds: ticketIds,
+                walletType,
+                joinRequestId,
+                rejoin: true,
+              }).then((ticket) => {
+                if (ticket.spectator && ticket.state) {
+                  setIsSpectator(true);
+                  activeRoomRequestedRef.current = false;
+                  hasJoinedRoomOnceRef.current = false;
+                  roomCardIdsRef.current = [];
+                  setCards([]);
+                  applyRoomSnapshot(ticket.state);
+                  setStatus('in_progress');
+                  return;
+                }
+                if (!ticket.ok || !ticket.state || !ticket.cards) {
+                  showToast(ticket.error || 'Could not restore your active cartela.');
+                  return;
+                }
+                setIsSpectator(false);
+                roomCardIdsRef.current = ticket.cards.map((card) => card.cardIndex);
+                hasJoinedRoomOnceRef.current = true;
+                activeRoomRequestedRef.current = true;
+                const called = new Set(ticket.state.called);
+                setCards(ticket.cards.map((card) => {
+                  const restored = {
+                    ...card,
+                    cells: card.cells.map((row) => row.map((cell) => ({
+                      ...cell,
+                      isDaubed: cell.isFree || cell.isDaubed || (settingsRef.current.autoDaub && called.has(cell.number)),
+                    }))),
+                  };
+                  const win = checkCardWinningPatterns(restored, settingsRef.current.language);
+                  return {
+                    ...restored,
+                    numbersNeeded: calculateNumbersNeeded(restored),
+                    hasWon: win.hasWon,
+                    winningPatternName: win.patternName,
+                  };
+                }));
+                if (typeof ticket.balance === 'number') {
+                  setUser((previous) => ({
+                    ...previous,
+                    balance: ticket.mainWallet ?? ticket.balance!,
+                    mainWallet: ticket.mainWallet ?? ticket.balance!,
+                    playWallet: ticket.playWallet ?? previous.playWallet ?? 0,
+                  }));
+                }
+                applyRoomSnapshot(ticket.state);
+                setStatus('in_progress');
+              }).catch((error: unknown) => {
+                console.error('Could not restore the active cartela:', error);
+                showToast('Could not restore your active cartela.');
+              });
+              return;
+            }
+          }
+          setIsSpectator(true);
+          setCards([]);
           applyRoomSnapshot(res.state);
+          setStatus('in_progress');
+          return;
         }
+        setIsSpectator(false);
       }
     });
   };
@@ -1151,15 +1134,26 @@ export default function App() {
   // Step 2: Confirm Selected Cartelas and Launch Round
   const handleConfirmCartelaSelection = async (
     selectedCards: BingoCardModel[],
-    roomPlayersCount?: number,
-    totalRoomCartelas?: number,
     walletType: 'main_wallet' | 'play_wallet' = 'main_wallet'
   ) => {
+    if (selectedCards.length === 0) return false;
+    const availableBalance = walletType === 'play_wallet' ? user.playWallet ?? 0 : user.mainWallet ?? user.balance;
+    const cost = settings.selectedStake * selectedCards.length;
+    if (availableBalance < cost) {
+      showToast('Insufficient balance to join with the selected cartelas.');
+      return false;
+    }
+    setActiveTab('game');
+    setCountdown(0);
+    setStatus('starting');
     hasJoinedRoomOnceRef.current = true;
     activeRoomRequestedRef.current = true;
     lastProcessedWinnerGameIdRef.current = null;
     roomCardIdsRef.current = selectedCards.map((c) => c.cardIndex);
     setCards(selectedCards);
+    setRoomPlayers([{ name: user.firstName || 'Player', cardsCount: selectedCards.length, isOnline: true }]);
+    setPrizePool(Math.floor(selectedCards.length * settings.selectedStake * 0.8));
+    setActiveGameId(GLOBAL_BINGO_ROOM_ID);
     roomWalletTypeRef.current = walletType;
     hasPlayedBingoAudioThisRoundRef.current = false;
     const joinRequestId = crypto.randomUUID();
@@ -1168,31 +1162,30 @@ export default function App() {
     localStorage.setItem(joinKey, joinRequestId);
     try {
       const socket = getOrCreateSocket();
-      if (!socket.connected) {
-        await new Promise<void>((resolve, reject) => {
-          const timeout = setTimeout(() => reject(new Error('Room connection timed out')), 1_500);
-          socket.once('connect', () => {
-            clearTimeout(timeout);
-            resolve();
-          });
-          socket.once('connect_error', (error) => {
-            clearTimeout(timeout);
-            reject(error);
-          });
-          if (!socket.active) socket.connect();
-        });
-      }
+      if (!socket.connected && !socket.active) socket.connect();
 
       const result = await emitBingoWithAck<BingoJoinResult>(socket, 'room:join', {
         stake: settings.selectedStake,
+        roomId: GLOBAL_BINGO_ROOM_ID,
         cardIds: selectedCards.map((card) => card.cardIndex),
         joinRequestId,
         walletType,
-      });
+      }, 0);
+      if (result.spectator && result.state) {
+        setIsSpectator(true);
+        activeRoomRequestedRef.current = false;
+        hasJoinedRoomOnceRef.current = false;
+        roomCardIdsRef.current = [];
+        setCards([]);
+        applyRoomSnapshot(result.state);
+        setStatus('in_progress');
+        return true;
+      }
       if (!result.ok || !result.state || !result.cards || typeof result.balance !== 'number') {
-        throw new Error(result.error || 'Could not join the shared game');
+        throw new Error(result.error || 'Could not join the live room');
       }
 
+      setIsSpectator(false);
       const initialCalled = new Set(result.state.called || []);
       const readyCards = result.cards.map((card) => {
         const cells = card.cells.map((row) =>
@@ -1234,33 +1227,47 @@ export default function App() {
       lastCalledNumberRef.current = null;
       applyRoomSnapshot(result.state);
       sounds.playBeep(true);
-      setStatus(result.state.status === 'finished' ? 'game_over' : 'in_progress');
-    } catch (error: any) {
+      setStatus(
+        result.state.status === 'finished'
+          ? 'game_over'
+          : result.state.status === 'in_progress' ? 'in_progress' : 'starting'
+      );
+      return true;
+    } catch (error) {
       activeRoomRequestedRef.current = false;
-      console.warn('Network socket join issue, entering synchronized round:', error);
-      const cycle = getGlobalBingoCycle();
-      setActiveGameId(cycle.gameId);
-      const playersCount = Math.max(12, roomPlayersCount || 15);
-      const totalCartelas = Math.max(playersCount * 2, totalRoomCartelas || 30);
-      setActiveRoomPlayers(playersCount);
-      setActiveRoomCartelas(totalCartelas);
-      setPrizePool(Math.floor(totalCartelas * settings.selectedStake * 0.8));
-      setCompetitors(generateCompetitors());
-      setCards(selectedCards);
-      sounds.playBeep(true);
-      setStatus('in_progress');
+      hasJoinedRoomOnceRef.current = false;
+      localStorage.removeItem(joinKey);
+      setStatus('cartela_select');
+      setIsSpectator(false);
+      roomCardIdsRef.current = [];
+      console.error('Could not join the global bingo room:', error);
+      showToast(error instanceof Error ? error.message : 'Could not join the global bingo room.');
+      return false;
     }
   };
 
   const handleResetGame = () => {
-    // If returning to lobby while game is active, just switch view so player can come back seamlessly
     if (statusRef.current === 'in_progress') {
+      gameSocketRef.current?.emit('room:leave', { stake: settings.selectedStake });
+      activeRoomRequestedRef.current = false;
+      hasJoinedRoomOnceRef.current = false;
+      roomCardIdsRef.current = [];
+      roomJoinRequestIdRef.current = null;
+      setIsSpectator(false);
+      if (typeof window !== 'undefined') {
+        localStorage.removeItem('salery_bingo_has_joined_room_once');
+        localStorage.removeItem('salery_bingo_active_room_requested');
+        localStorage.removeItem('salery_bingo_room_card_ids');
+        localStorage.removeItem('salery_bingo_room_wallet_type');
+        localStorage.removeItem('salery_bingo_room_join_request_id');
+      }
       setStatus('idle');
       return;
     }
     gameSocketRef.current?.emit('room:leave', { stake: settings.selectedStake });
     activeRoomRequestedRef.current = false;
     hasJoinedRoomOnceRef.current = false;
+    setIsSpectator(false);
     lastProcessedWinnerGameIdRef.current = null;
     claimInFlightRef.current = false;
     if (typeof window !== 'undefined') {
@@ -1276,7 +1283,7 @@ export default function App() {
     setCurrentBall(null);
     setPrizePool(0);
     setRoomPlayers([]);
-    setActiveGameId('');
+    setActiveGameId(GLOBAL_BINGO_ROOM_ID);
     setWinnerInfo(null);
     setShowWinModal(false);
     setWinResult(null);
@@ -1287,6 +1294,7 @@ export default function App() {
     gameSocketRef.current?.emit('room:leave', { stake: settings.selectedStake });
     activeRoomRequestedRef.current = false;
     hasJoinedRoomOnceRef.current = false;
+    setIsSpectator(false);
     lastProcessedWinnerGameIdRef.current = null;
     claimInFlightRef.current = false;
     if (typeof window !== 'undefined') {
@@ -1295,7 +1303,7 @@ export default function App() {
       localStorage.removeItem('salery_bingo_room_card_ids');
       localStorage.removeItem('salery_bingo_room_wallet_type');
       localStorage.removeItem('salery_bingo_room_join_request_id');
-      localStorage.removeItem(`salery_bingo_pending_room_${currentTelegramIdRef.current}`);
+      localStorage.removeItem(`salery_bingo_pending_room_${currentPlayerIdRef.current}`);
     }
     sounds.stopAllAudio();
     hasPlayedBingoAudioThisRoundRef.current = false;
@@ -1304,7 +1312,7 @@ export default function App() {
     setCurrentBall(null);
     setPrizePool(0);
     setRoomPlayers([]);
-    setActiveGameId('');
+    setActiveGameId(GLOBAL_BINGO_ROOM_ID);
     setWinnerInfo(null);
     setShowWinModal(false);
     setWinResult(null);
@@ -1330,7 +1338,7 @@ export default function App() {
     getOrCreateSocket();
   }, [settings.selectedStake, settings.cardsCount, initCards, getOrCreateSocket]);
 
-  const isLiveGameActive = status === 'in_progress' || status === 'paused' || status === 'countdown' || status === 'game_over';
+  const isLiveGameActive = status === 'starting' || status === 'in_progress' || status === 'paused' || status === 'countdown' || status === 'game_over';
 
   if (showAdminPanel) {
     return (
@@ -1349,7 +1357,7 @@ export default function App() {
       <BannedUserView
         user={user}
         onRefresh={async () => {
-          await refreshUserData(user.telegramId);
+          await refreshUserData();
         }}
       />
     );
@@ -1427,12 +1435,11 @@ export default function App() {
                 onToggleAutoDaub={(enabled) =>
                   setSettings((prev) => ({ ...prev, autoDaub: enabled }))
                 }
-                prizePool={prizePool}
                 autoDaubEnabled={settings.autoDaub}
-                totalPlayersCount={activeRoomCartelas || cards.length || activeRoomPlayers}
                 gameId={activeGameId}
                 roomPlayers={roomPlayers}
                 status={status}
+                spectatorMode={isSpectator}
                 winnerInfo={winnerInfo}
                 onPlayAgain={handleReturnToCartelaSelect}
               />
@@ -1496,6 +1503,7 @@ export default function App() {
           winningCard={cards.find((c) => c.cardIndex === winnerInfo?.cardId) || cards.find((c) => c.hasWon) || null}
           wonAmount={wonAmount}
           language={settings.language}
+          winnerId={winnerInfo?.winnerId}
           winnerName={winnerInfo?.winnerName}
           cardId={winnerInfo?.cardId}
           isMe={winnerInfo?.isMe}

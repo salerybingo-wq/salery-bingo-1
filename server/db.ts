@@ -18,6 +18,7 @@ export interface DbUser {
   ban_reason?: string;
   is_verified: boolean;
   referred_by?: string;
+  share_bonus_awarded?: boolean;
   referral_count: number;
   total_deposited: number;
   total_withdrawn: number;
@@ -184,23 +185,6 @@ export class LocalSecureDatabase {
     this.ensureDefaultAdmin();
   }
 
-  private isLocalDevMode(): boolean {
-    return process.env.NODE_ENV !== 'production' || process.env.LOCALHOST_TEST === 'true' || process.env.VITE_DEV_SERVER === 'true';
-  }
-
-  private forceLocalDevBalance() {
-    if (!this.isLocalDevMode()) return;
-
-    Object.values(this.data.users).forEach((user) => {
-      if (user.role !== 'admin') {
-        user.balance = 100;
-        user.updated_at = new Date().toISOString();
-      }
-    });
-
-    this.persistSync();
-  }
-
   private getDataSignature(data: DatabaseSchema): string {
     const { updated_at, ...rest } = data as DatabaseSchema & { updated_at?: string };
     return JSON.stringify(rest);
@@ -299,13 +283,13 @@ export class LocalSecureDatabase {
         full_name: 'ሳለሪ አድሚን (Admin)',
         username: 'salery_admin',
         phone_number: '+251911000000',
-        balance: 24560,
+        balance: 0,
         role: 'admin',
         status: 'active',
         is_blocked: false,
         is_verified: true,
         referral_count: 0,
-        total_deposited: 50000,
+        total_deposited: 0,
         total_withdrawn: 0,
         games_played: 15,
         games_won: 8,
@@ -324,7 +308,7 @@ export class LocalSecureDatabase {
         full_name: 'Jo_cr7 (@jo_cr7)',
         username: 'jo_cr7',
         phone_number: '+251908336796',
-        balance: 10,
+        balance: 0,
         role: 'user',
         status: 'active',
         is_blocked: false,
@@ -354,7 +338,7 @@ export class LocalSecureDatabase {
           full_name: p.full_name || p.first_name || 'Player',
           username: p.username || '',
           phone_number: p.phone_number || '',
-          balance: p.balance ?? 1000,
+          balance: p.balance ?? 0,
           role: 'user',
           status: 'active',
           is_blocked: false,
@@ -407,8 +391,10 @@ export class LocalSecureDatabase {
       this.scheduleSave();
       return updated;
     } else {
-      const initialMain = user.main_wallet !== undefined ? user.main_wallet : (user.balance !== undefined ? user.balance : 0);
-      const initialPlay = user.play_wallet !== undefined ? user.play_wallet : 10; // 10 ETB Signup Bonus!
+      const initialMain = user.main_wallet !== undefined
+        ? user.main_wallet
+        : (user.balance !== undefined ? user.balance : 0);
+      const initialPlay = user.play_wallet !== undefined ? user.play_wallet : 0;
       const newUser: DbUser = {
         id: Date.now(),
         telegram_id: key,

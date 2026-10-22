@@ -2,6 +2,8 @@ import React, { useState, useEffect, useRef } from 'react';
 import { BingoBall, BingoCardModel, GameSettings, UserProfile } from '../types';
 import { Volume2, VolumeX, Star } from 'lucide-react';
 import { sounds } from '../utils/audio';
+import { clearLegacyLocalRoomId } from '../utils/roomStorage';
+import { GLOBAL_BINGO_ROOM_ID } from '../utils/bingoSocket';
 
 interface GamePlayViewProps {
   user: UserProfile;
@@ -16,13 +18,12 @@ interface GamePlayViewProps {
   onRefresh?: () => void;
   onToggleAutoDaub?: (val: boolean) => void;
   onPlayAgain?: () => void;
-  prizePool: number;
   autoDaubEnabled: boolean;
-  totalPlayersCount?: number;
   gameId?: string;
   roomPlayers?: Array<{ name: string; cardsCount: number; isOnline?: boolean }>;
   status?: string;
-  winnerInfo?: { winnerName?: string; cardId?: number; prize?: number; isMe?: boolean } | null;
+  spectatorMode?: boolean;
+  winnerInfo?: { winnerId?: string; winnerName?: string; cardId?: number; prize?: number; isMe?: boolean } | null;
 }
 
 export const GamePlayView: React.FC<GamePlayViewProps> = ({
@@ -38,16 +39,19 @@ export const GamePlayView: React.FC<GamePlayViewProps> = ({
   onRefresh,
   onToggleAutoDaub,
   onPlayAgain,
-  prizePool,
   autoDaubEnabled,
-  totalPlayersCount = 0,
   gameId = 'CONNECTING',
   roomPlayers = [],
   status,
+  spectatorMode = false,
   winnerInfo,
 }) => {
   const [muted, setMuted] = useState<boolean>(false);
   const [activeCardIdx, setActiveCardIdx] = useState<number>(0);
+
+  useEffect(() => {
+    clearLegacyLocalRoomId();
+  }, []);
 
   // Start BGM on mount and stop on unmount cleanly
   React.useEffect(() => {
@@ -66,11 +70,10 @@ export const GamePlayView: React.FC<GamePlayViewProps> = ({
 
   const activeCard = cards[activeCardIdx] || cards[0];
 
-  const roomCartelasCount = roomPlayers.reduce((total, p) => total + (p.cardsCount || 1), 0);
-  const displayPlayersCount = Math.max(roomCartelasCount, totalPlayersCount, cards.length, 1);
-  const totalCardsInGame = Math.max(roomCartelasCount, totalPlayersCount, cards.length, 1);
-  const calculatedDerash = Math.floor(totalCardsInGame * settings.selectedStake * 0.8);
-  const totalDerash = prizePool > 0 ? prizePool : calculatedDerash;
+  const participatingPlayers = roomPlayers.filter((player) => player.cardsCount > 0);
+  const displayPlayersCount = participatingPlayers.length;
+  const totalCardsInGame = participatingPlayers.reduce((total, player) => total + player.cardsCount, 0);
+  const totalDerash = totalCardsInGame * settings.selectedStake * 0.8;
 
   const [gameOverCountdown, setGameOverCountdown] = useState<number>(5);
   const hasTriggeredGameOverRef = useRef(false);
@@ -79,7 +82,7 @@ export const GamePlayView: React.FC<GamePlayViewProps> = ({
 
   // Auto redirect to game selection after 5 seconds when round concludes
   useEffect(() => {
-    if (status === 'game_over') {
+    if (status === 'game_over' && !winnerInfo?.winnerId) {
       setGameOverCountdown(5);
       hasTriggeredGameOverRef.current = false;
       const interval = setInterval(() => {
@@ -93,21 +96,26 @@ export const GamePlayView: React.FC<GamePlayViewProps> = ({
       }, 1000);
       return () => clearInterval(interval);
     }
-  }, [status]);
+  }, [status, winnerInfo?.winnerId]);
 
   useEffect(() => {
-    if (status === 'game_over' && gameOverCountdown === 0) {
+    if (status === 'game_over' && !winnerInfo?.winnerId && gameOverCountdown === 0) {
       if (!hasTriggeredGameOverRef.current) {
         hasTriggeredGameOverRef.current = true;
         onPlayAgainRef.current?.();
       }
     }
-  }, [status, gameOverCountdown]);
+  }, [status, winnerInfo?.winnerId, gameOverCountdown]);
 
   return (
-    <div className="w-full max-w-[460px] mx-auto px-2 py-1.5 select-none animate-fadeIn flex flex-col justify-between min-h-[90vh]">
+    <div data-room-id={GLOBAL_BINGO_ROOM_ID} className="w-full max-w-[460px] mx-auto px-2 py-1.5 select-none animate-fadeIn flex flex-col justify-between min-h-[90vh]">
       <div>
-        {/* 1. TOP HEADER BAR: 5 Stat Cards in 1 Row (Exact match to Screenshot 2439) */}
+        {spectatorMode && (
+          <div className="mb-2 rounded-xl border border-sky-500/40 bg-sky-950/60 px-3 py-2 text-center text-xs font-bold text-sky-200">
+            Spectator mode — you can watch this round, but need a cartela to play next round.
+          </div>
+        )}
+        {/* 1. TOP HEADER BAR: 5 Stat Cards in 1 Row */}
         <div className="grid grid-cols-5 gap-1 mb-2">
           {/* Game ID */}
           <div className="bg-[#1f1938] border border-[#322a57] rounded-xl py-1.5 px-0.5 text-center flex flex-col justify-center shadow-inner">
@@ -125,7 +133,10 @@ export const GamePlayView: React.FC<GamePlayViewProps> = ({
               Players
             </span>
             <span className="font-mono text-xs sm:text-sm font-black text-white mt-0.5">
-              {displayPlayersCount}
+              {totalCardsInGame}
+            </span>
+            <span className="text-[7px] font-bold text-slate-400 mt-0.5">
+              {displayPlayersCount} active
             </span>
           </div>
 
@@ -155,7 +166,7 @@ export const GamePlayView: React.FC<GamePlayViewProps> = ({
               Called
             </span>
             <span className="font-mono text-xs sm:text-sm font-black text-white mt-0.5">
-              {calledBalls.length}
+              {calledSet.size}
             </span>
           </div>
         </div>
@@ -254,7 +265,7 @@ export const GamePlayView: React.FC<GamePlayViewProps> = ({
                 </div>
               ) : (
                 <div className="w-14 h-14 rounded-full bg-[#1e173b] border-2 border-dashed border-[#382f63] flex items-center justify-center text-slate-500 font-bold text-xs">
-                  WAITING
+                  {status === 'starting' ? 'STARTING' : 'WAITING'}
                 </div>
               )}
             </div>

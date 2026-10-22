@@ -10,10 +10,8 @@ interface CartelaSelectionViewProps {
   onBack: () => void;
   onConfirmSelection: (
     selectedCards: BingoCardModel[],
-    roomPlayersCount?: number,
-    totalRoomCartelas?: number,
     walletType?: 'main_wallet' | 'play_wallet'
-  ) => void;
+  ) => boolean | Promise<boolean>;
   onUpdateSettings?: (newSettings: Partial<GameSettings>) => void;
   socket?: any;
   roomStartsAt?: number;
@@ -45,14 +43,15 @@ export const CartelaSelectionView: React.FC<CartelaSelectionViewProps> = ({
     return cycle.selectionEndsAt;
   });
 
+  const serverClockOffsetRef = React.useRef(0);
   const computeRemaining = useCallback((targetTs: number) => {
     if (!targetTs) return 35;
-    return Math.max(0, Math.ceil((targetTs - Date.now()) / 1000));
+    return Math.max(0, Math.ceil((targetTs - (Date.now() + serverClockOffsetRef.current)) / 1000));
   }, []);
 
   // Sync with roomStartsAt whenever the parent passes an updated timestamp
   useEffect(() => {
-    if (typeof roomStartsAt === 'number' && roomStartsAt > Date.now()) {
+    if (typeof roomStartsAt === 'number' && roomStartsAt > Date.now() + serverClockOffsetRef.current) {
       setServerStartsAt(roomStartsAt);
       setTimeLeft(computeRemaining(roomStartsAt));
     }
@@ -60,11 +59,12 @@ export const CartelaSelectionView: React.FC<CartelaSelectionViewProps> = ({
 
   // Countdown timer derived from server room timestamp
   const [timeLeft, setTimeLeft] = useState<number>(() => computeRemaining(serverStartsAt));
-  const [isStarting, setIsStarting] = useState<boolean>(false);
   const hasStartedRef = React.useRef<boolean>(false);
+  const localEmptyResetStartsAtRef = React.useRef(0);
 
   // Taken cartelas by other active players (cartelaId -> username)
   const [remoteClaims, setRemoteClaims] = useState<Map<number, string>>(() => new Map<number, string>());
+  const reservationRequestIdRef = React.useRef(0);
 
   // User selected cartela IDs (starts fresh each game)
   const [selectedCartelaIds, setSelectedCartelaIds] = useState<number[]>([]);
@@ -132,16 +132,13 @@ export const CartelaSelectionView: React.FC<CartelaSelectionViewProps> = ({
     const syncRoom = () => {
       socket.emit('cartela:room_enter', { stake: settings.selectedStake }, (res: any) => {
         if (res && res.ok && res.state) {
+          if (typeof res.state.serverNow === 'number') {
+            serverClockOffsetRef.current = res.state.serverNow - Date.now();
+          }
           if (typeof res.state.startsAt === 'number' && res.state.status === 'waiting') {
             setServerStartsAt(res.state.startsAt);
             setTimeLeft(computeRemaining(res.state.startsAt));
-          }
-          if (res.state.status === 'in_progress') {
-            if (res.joinedPlayer?.cardIds?.length > 0) {
-              setSelectedCartelaIds(res.joinedPlayer.cardIds);
-              const cards = res.joinedPlayer.cards || res.joinedPlayer.cardIds.map((id: number) => generateCartelaByNumber(id));
-              onConfirmSelection(cards, res.state.playerCount, res.state.totalCards, res.joinedPlayer.walletType || walletType);
-            }
+            localEmptyResetStartsAtRef.current = 0;
           }
         }
       });
@@ -152,7 +149,9 @@ export const CartelaSelectionView: React.FC<CartelaSelectionViewProps> = ({
     }
     socket.on('connect', syncRoom);
 
-    const handleReservedList = (data: { stake: number; takenCartelas: Record<number, string> }) => {
+    const handleReservedList = (data: {
+      takenCartelas: Record<number, string>;
+    }) => {
       if (data && data.takenCartelas) {
         const claimsMap = new Map<number, string>();
         for (const [cidStr, username] of Object.entries(data.takenCartelas)) {
@@ -168,19 +167,12 @@ export const CartelaSelectionView: React.FC<CartelaSelectionViewProps> = ({
 
     const handleRoomState = (data: any) => {
       if (data) {
-        if (data.takenCartelas) {
-          setRemoteClaims((prev) => {
-            const next = new Map(prev);
-            for (const [cidStr, username] of Object.entries(data.takenCartelas)) {
-              const cid = Number(cidStr);
-              if (!selectedCartelaIdsRef.current.includes(cid)) {
-                next.set(cid, (username as string) || 'Player');
-              }
-            }
-            return next;
-          });
-        }
         if (typeof data.startsAt === 'number' && data.status === 'waiting') {
+          if (typeof data.serverNow === 'number') {
+            serverClockOffsetRef.current = data.serverNow - Date.now();
+          }
+          if (data.startsAt < localEmptyResetStartsAtRef.current) return;
+          localEmptyResetStartsAtRef.current = 0;
           setServerStartsAt(data.startsAt);
           setTimeLeft(computeRemaining(data.startsAt));
           hasStartedRef.current = false;
@@ -188,13 +180,37 @@ export const CartelaSelectionView: React.FC<CartelaSelectionViewProps> = ({
       }
     };
 
+    const handleRoomTick = (data: { startsAt?: number; serverNow?: number; secondsRemaining?: number; status?: string }) => {
+      if (typeof data?.serverNow === 'number') {
+        serverClockOffsetRef.current = data.serverNow - Date.now();
+      }
+      if (
+        typeof data?.startsAt === 'number' &&
+        data.startsAt < localEmptyResetStartsAtRef.current
+      ) {
+        return;
+      }
+      if (typeof data?.startsAt === 'number') {
+        localEmptyResetStartsAtRef.current = 0;
+        setServerStartsAt(data.startsAt);
+      }
+      if (typeof data?.secondsRemaining === 'number') {
+        setTimeLeft(Math.max(0, data.secondsRemaining));
+      }
+      if (data?.status === 'waiting' && (data.secondsRemaining || 0) > 0) {
+        hasStartedRef.current = false;
+      }
+    };
+
     socket.on('cartela:reserved_list', handleReservedList);
-    socket.on('room:state', handleRoomState);
+    socket.on('room:selection_state', handleRoomState);
+    socket.on('room:tick', handleRoomTick);
 
     return () => {
       socket.off('connect', syncRoom);
       socket.off('cartela:reserved_list', handleReservedList);
-      socket.off('room:state', handleRoomState);
+      socket.off('room:selection_state', handleRoomState);
+      socket.off('room:tick', handleRoomTick);
       socket.emit('cartela:release', { stake: settings.selectedStake });
     };
   }, [socket, settings.selectedStake]);
@@ -202,9 +218,17 @@ export const CartelaSelectionView: React.FC<CartelaSelectionViewProps> = ({
   // Broadcast user selections to server via Socket
   const broadcastMySelection = (ids: number[]) => {
     if (socket?.connected) {
+      const requestId = ++reservationRequestIdRef.current;
       socket.emit('cartela:reserve', {
         stake: settings.selectedStake,
         cardIds: ids,
+      }, (result: { ok?: boolean; acceptedIds?: number[]; rejectedIds?: number[] }) => {
+        if (requestId !== reservationRequestIdRef.current || !result?.ok || !result.rejectedIds?.length) return;
+        const acceptedIds = result.acceptedIds || [];
+        selectedCartelaIdsRef.current = acceptedIds;
+        setSelectedCartelaIds(acceptedIds);
+        setPreviewCartelaId(acceptedIds[acceptedIds.length - 1] ?? null);
+        sounds.playBeep(false);
       });
     }
   };
@@ -228,16 +252,9 @@ export const CartelaSelectionView: React.FC<CartelaSelectionViewProps> = ({
     }));
   }, [activeDisplayIds]);
 
-  const handleStartRound = useCallback(() => {
-    let effectiveIds = [...selectedCartelaIdsRef.current];
-
-    // If player hasn't selected cartela before countdown ends, auto-assign 1 cartela so everyone enters together!
-    if (effectiveIds.length === 0) {
-      const fallbackId = previewCartelaIdRef.current || Math.floor(Math.random() * 400) + 1;
-      effectiveIds = [fallbackId];
-      setSelectedCartelaIds(effectiveIds);
-    }
-
+  const handleJoinGame = useCallback(async () => {
+    const effectiveIds = [...selectedCartelaIdsRef.current];
+    if (effectiveIds.length === 0) return;
     if (hasStartedRef.current) return;
     hasStartedRef.current = true;
 
@@ -250,19 +267,20 @@ export const CartelaSelectionView: React.FC<CartelaSelectionViewProps> = ({
 
     if (affordable <= 0 && currentBal < settings.selectedStake) {
       sounds.playBeep(false);
+      hasStartedRef.current = false;
       return;
     }
 
-    setIsStarting(true);
-
     const finalCards = effectiveIds.map((id) => generateCartelaByNumber(id));
 
-    // Ensure there are always competitors and at least 2 cartelas playing in the game
-    const competitorCount = Math.max(1, remoteClaims.size || 2);
-    const totalRoomCartelas = effectiveIds.length + competitorCount;
-    const roomPlayersCount = 1 + competitorCount;
-
-    onConfirmSelection(finalCards, roomPlayersCount, totalRoomCartelas, activeW);
+    try {
+      const joined = await onConfirmSelection(finalCards, activeW);
+      if (!joined) {
+        hasStartedRef.current = false;
+      }
+    } catch {
+      hasStartedRef.current = false;
+    }
   }, [
     walletType,
     playWalletBalance,
@@ -272,38 +290,38 @@ export const CartelaSelectionView: React.FC<CartelaSelectionViewProps> = ({
     onConfirmSelection,
   ]);
 
-  // Robust countdown timer: updates every second and launches when timer reaches 0
+  // Join automatically at expiry only when the player has selected cartelas.
   useEffect(() => {
     const timer = setInterval(() => {
-      const now = Date.now();
       let target = serverStartsAt;
-      if (typeof roomStartsAt === 'number' && roomStartsAt > now) {
+      if (typeof roomStartsAt === 'number' && roomStartsAt > Date.now() + serverClockOffsetRef.current) {
         target = roomStartsAt;
-      } else if (!target || target <= now) {
-        const cycle = getGlobalBingoCycle(now);
+      } else if (!target) {
+        const cycle = getGlobalBingoCycle(Date.now() + serverClockOffsetRef.current);
         target = cycle.selectionEndsAt;
         setServerStartsAt(target);
       }
 
-      const remaining = Math.min(35, Math.max(0, Math.ceil((target - now) / 1000)));
-      setTimeLeft(remaining);
-
-      if (remaining <= 0 && !hasStartedRef.current) {
-        if (selectedCartelaIdsRef.current.length > 0) {
-          handleStartRound();
-        } else {
-          // Advance to next synchronized 35s cycle
-          const nextCycle = getGlobalBingoCycle(now + 1000);
-          setServerStartsAt(nextCycle.selectionEndsAt);
-          setTimeLeft(nextCycle.remainingSeconds);
-        }
+      const remaining = Math.min(35, computeRemaining(target));
+      const hasSelections = selectedCartelaIdsRef.current.length > 0;
+      const displayRemaining = socket?.connected && remaining === 0 && !hasSelections
+        ? 1
+        : remaining;
+      setTimeLeft(displayRemaining);
+      if (remaining === 0 && selectedCartelaIdsRef.current.length > 0) {
+        void handleJoinGame();
+      } else if (remaining === 0 && !socket?.connected && localEmptyResetStartsAtRef.current === 0) {
+        const nextStartsAt = Date.now() + serverClockOffsetRef.current + GLOBAL_SELECTION_WINDOW_MS;
+        localEmptyResetStartsAtRef.current = nextStartsAt;
+        setServerStartsAt(nextStartsAt);
+        setTimeLeft(Math.ceil(GLOBAL_SELECTION_WINDOW_MS / 1000));
       }
     }, 1000);
 
     return () => {
       clearInterval(timer);
     };
-  }, [serverStartsAt, roomStartsAt, handleStartRound]);
+  }, [serverStartsAt, roomStartsAt, handleJoinGame, socket?.connected, computeRemaining]);
 
   // Handle cartel cell click
   const handleCartelaClick = (cartelaNum: number) => {
@@ -357,6 +375,7 @@ export const CartelaSelectionView: React.FC<CartelaSelectionViewProps> = ({
     }
 
     setSelectedCartelaIds(updatedIds);
+    selectedCartelaIdsRef.current = updatedIds;
     broadcastMySelection(updatedIds);
   };
 
@@ -622,6 +641,7 @@ export const CartelaSelectionView: React.FC<CartelaSelectionViewProps> = ({
           </div>
         </div>
       )}
+
     </div>
   );
 };

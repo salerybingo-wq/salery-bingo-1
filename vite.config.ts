@@ -17,6 +17,17 @@ export default defineConfig(() => {
     server: {
       port: 3000,
       host: '0.0.0.0',
+      proxy: {
+        '/api': {
+          target: 'http://localhost:8080',
+          changeOrigin: true,
+        },
+        '/socket.io': {
+          target: 'http://localhost:8080',
+          changeOrigin: true,
+          ws: true,
+        },
+      },
       // Disable Vite HMR to avoid iframe WebSocket proxy connection errors
       hmr: false,
       watch: {

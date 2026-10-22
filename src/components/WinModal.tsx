@@ -9,6 +9,7 @@ interface WinModalProps {
   winningCard: BingoCardModel | null;
   wonAmount: number;
   language: 'am' | 'en' | 'om';
+  winnerId?: string;
   winnerName?: string;
   cardId?: number;
   isMe?: boolean;
@@ -21,6 +22,7 @@ export const WinModal: React.FC<WinModalProps> = ({
   winResult,
   winningCard,
   wonAmount,
+  winnerId,
   winnerName,
   cardId,
   isMe = true,
@@ -61,9 +63,7 @@ export const WinModal: React.FC<WinModalProps> = ({
   if (!activeWinningCard) return null;
 
   const displayWinnerName = winnerName || (isMe ? (user.firstName || user.username || 'YOU') : 'ተጫዋች');
-  const userTgId = isMe && user.telegramId
-    ? String(user.telegramId).slice(-4)
-    : String(activeWinningCard.cardIndex);
+  const displayWinnerId = winnerId || (isMe && user.telegramId ? String(user.telegramId) : '');
 
   const winningCoordsSet = new Set(
     (winResult?.winningCoordinates || []).map((c) => `${c.row}-${c.col}`)
@@ -109,7 +109,8 @@ export const WinModal: React.FC<WinModalProps> = ({
                 {displayWinnerName}
               </span>
               <span className="block text-[10px] font-mono text-slate-400 font-bold">
-                ካርቴላ #{activeWinningCard.cardIndex} • ID #{userTgId}
+                ካርቴላ #{activeWinningCard.cardIndex}
+                {displayWinnerId && ` • ID #${displayWinnerId.slice(-4)}`}
               </span>
             </div>
           </div>

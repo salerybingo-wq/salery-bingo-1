@@ -175,7 +175,7 @@ export const WalletView: React.FC<WalletViewProps> = ({
               </div>
               <div className="flex items-center gap-2 text-[11px] text-amber-300 font-mono font-bold mt-0.5">
                 <span>መለያ ID: {playerUniqueId}</span>
-                <span className="text-slate-400">· TG: {user.telegramId}</span>
+                <span className="text-slate-400">· ID: {String(user.telegramId).slice(-4)}</span>
               </div>
             </div>
           </div>

@@ -7,7 +7,9 @@
     "node": "24.x"
   },
   "scripts": {
-    "dev": "tsx server.ts",
+    "dev": "concurrently --names client,server --prefix-colors cyan,green \"npm:dev:client\" \"npm:dev:server\"",
+    "dev:client": "vite --host 0.0.0.0 --port 3000 --strictPort",
+    "dev:server": "tsx server.ts",
     "build": "vite build && npx esbuild server.ts --bundle --platform=node --format=esm --packages=external --outfile=server.js && cp server.js server/index.js 2>/dev/null || true",
     "build:server": "npx esbuild server.ts --bundle --platform=node --format=esm --packages=external --outfile=server/index.js && cp server/index.js server.js 2>/dev/null || true",
     "start": "node server.js",
@@ -49,6 +51,7 @@
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "@types/ws": "^8.18.2",
-    "autoprefixer": "^10.4.21"
+    "autoprefixer": "^10.4.21",
+    "concurrently": "^10.0.6"
   }
 }

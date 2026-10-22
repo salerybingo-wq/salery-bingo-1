@@ -21,33 +21,6 @@ export {
   SUPABASE_SQL_SCHEMA,
 };
 
-function getLocalMockTelegramInitData(): string {
-  if (typeof window === 'undefined') return '';
-
-  const hostname = window.location.hostname;
-  const isLocal = hostname === 'localhost' || hostname === '127.0.0.1';
-  if (!isLocal && process.env.NODE_ENV === 'production') return '';
-
-  const existing = localStorage.getItem('salery_bingo_mock_tg_id');
-  const nextId = existing && !Number.isNaN(Number(existing)) ? String(existing) : String(Math.floor(100000000 + Math.random() * 900000000));
-  localStorage.setItem('salery_bingo_mock_tg_id', nextId);
-  return `mock:${nextId}`;
-}
-
-function getTelegramAuthorizationHeader(): Record<string, string> {
-  let initData = '';
-  if (typeof window !== 'undefined') {
-    initData = String((window as any).Telegram?.WebApp?.initData || '');
-    if (!initData) {
-      initData = new URLSearchParams(window.location.hash.slice(1)).get('tgWebAppData') || '';
-    }
-    if (!initData && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1' || process.env.NODE_ENV !== 'production')) {
-      initData = getLocalMockTelegramInitData();
-    }
-  }
-  return initData ? { Authorization: `tma ${initData}` } : {};
-}
-
 function getAuthenticatedBackendUrls(): string[] {
   const urls: string[] = [];
   if (typeof window !== 'undefined' && !isStaticFrontendUrl(window.location.origin)) {
@@ -55,6 +28,34 @@ function getAuthenticatedBackendUrls(): string[] {
   }
   if (!urls.includes(PRIMARY_LIVE_BACKEND)) urls.push(PRIMARY_LIVE_BACKEND);
   return urls;
+}
+
+interface TelegramMiniAppUser {
+  id: number;
+  first_name?: string;
+  username?: string;
+}
+
+function getTelegramMiniAppAuth() {
+  if (typeof window === 'undefined') return null;
+  const webApp = (window as Window & {
+    Telegram?: {
+      WebApp?: {
+        initData?: string;
+        initDataUnsafe?: { user?: TelegramMiniAppUser };
+      };
+    };
+  }).Telegram?.WebApp;
+  const initData = webApp?.initData?.trim();
+  const user = webApp?.initDataUnsafe?.user;
+  return initData && Number.isSafeInteger(user?.id) && Number(user?.id) > 0
+    ? { initData, user: user! }
+    : null;
+}
+
+function getTelegramAuthorizationHeaders(): Record<string, string> {
+  const auth = getTelegramMiniAppAuth();
+  return auth ? { Authorization: `tma ${auth.initData}` } : {};
 }
 
 /**
@@ -416,21 +417,85 @@ export function getBackendBaseUrl(): string {
   return list[0] || '';
 }
 
+export interface BingoGuestSession {
+  playerId: number;
+  token: string;
+  balance: number;
+  mainWallet: number;
+  playWallet: number;
+  playerCode?: string;
+}
+
+export async function getBingoGuestSession(): Promise<BingoGuestSession> {
+  if (typeof window === 'undefined') throw new Error('Guest sessions are only available in a browser');
+
+  let savedSession: Partial<BingoGuestSession> | null = null;
+  try {
+    const saved = JSON.parse(localStorage.getItem('salery_bingo_guest_session') || 'null');
+    if (
+      Number.isSafeInteger(saved?.playerId) &&
+      saved.playerId > 0 &&
+      typeof saved.token === 'string' &&
+      /^[a-f0-9]{64}$/i.test(saved.token)
+    ) {
+      savedSession = { playerId: saved.playerId, token: saved.token };
+    }
+  } catch (error) {
+    console.warn('Could not read the saved guest session:', error);
+  }
+
+  let lastError: Error | null = null;
+  for (const baseUrl of getCandidateBackendUrls()) {
+    try {
+      const response = await fetch(`${baseUrl}/api/bingo/guest-session`, {
+        method: 'POST',
+        headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+        body: JSON.stringify(savedSession || {}),
+        signal: AbortSignal.timeout(5000),
+      });
+      const result = await response.json();
+      if (!response.ok || !result?.ok) {
+        lastError = new Error(result?.error || `Guest session request failed (${response.status})`);
+        continue;
+      }
+      if (
+        !Number.isSafeInteger(result.playerId) ||
+        typeof result.token !== 'string' ||
+        typeof result.balance !== 'number' ||
+        typeof result.mainWallet !== 'number' ||
+        typeof result.playWallet !== 'number'
+      ) {
+        lastError = new Error('Guest session response was invalid');
+        continue;
+      }
+
+      const session: BingoGuestSession = {
+        playerId: result.playerId,
+        token: result.token,
+        balance: result.balance,
+        mainWallet: result.mainWallet,
+        playWallet: result.playWallet,
+        playerCode: typeof result.playerCode === 'string' ? result.playerCode : undefined,
+      };
+      localStorage.setItem('salery_bingo_guest_session', JSON.stringify(session));
+      localStorage.setItem('salery_bingo_player_id', String(session.playerId));
+      localStorage.setItem('salery_bingo_unique_id', String(session.playerId));
+      return session;
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+    }
+  }
+  throw lastError || new Error('No backend could issue a guest session');
+}
+
 /**
  * Instant Player Registration & Sync across Supabase and Backend
  * Ensures player is recorded immediately in a split second
  */
-export async function syncUserRegistration(userData: {
-  telegramId: string | number;
-  firstName?: string;
-  username?: string;
-  phoneNumber?: string;
-  role?: string;
-  balance?: number;
-  playerCode?: string;
-  referredBy?: string;
-}): Promise<{ ok: boolean; user?: any; balance?: number }> {
-  const tId = String(userData.telegramId);
+export async function syncUserRegistration(): Promise<{ ok: boolean; user?: any; balance?: number }> {
+  const auth = getTelegramMiniAppAuth();
+  if (!auth) return { ok: false };
+  const tId = String(auth.user.id);
 
   const candidateUrls = getAuthenticatedBackendUrls();
   for (const baseUrl of candidateUrls) {
@@ -441,14 +506,10 @@ export async function syncUserRegistration(userData: {
         headers: {
           'Content-Type': 'application/json',
           Accept: 'application/json',
-          ...getTelegramAuthorizationHeader(),
+          Authorization: `tma ${auth.initData}`,
         },
         body: JSON.stringify({
           telegramId: tId,
-          firstName: userData.firstName,
-          username: userData.username,
-          phoneNumber: userData.phoneNumber,
-          referredBy: userData.referredBy,
         }),
         signal: AbortSignal.timeout(2500),
       });
@@ -461,7 +522,10 @@ export async function syncUserRegistration(userData: {
           balance: typeof data.balance === 'number' ? data.balance : undefined,
         };
       }
-    } catch {}
+      console.warn('Telegram Mini App user registration failed:', data?.error || res.statusText);
+    } catch (error) {
+      console.warn(`Could not register the Telegram Mini App user with ${baseUrl}:`, error);
+    }
   }
 
   return { ok: false };
@@ -485,8 +549,6 @@ export async function fetchUserProfile(telegramId: number | string): Promise<{
 } | null> {
   if (!telegramId) return null;
   const tId = String(telegramId);
-  const authorization = getTelegramAuthorizationHeader();
-  if (!authorization.Authorization) return null;
   const candidateUrls = getAuthenticatedBackendUrls();
 
   for (const baseUrl of candidateUrls) {
@@ -495,7 +557,7 @@ export async function fetchUserProfile(telegramId: number | string): Promise<{
     try {
       const res = await fetch(url, {
         method: 'GET',
-        headers: { Accept: 'application/json', ...authorization },
+        headers: { Accept: 'application/json', ...getTelegramAuthorizationHeaders() },
         signal: AbortSignal.timeout(2500),
       });
 
@@ -677,7 +739,7 @@ export async function fetchAdminUsers(): Promise<{
     try {
       const res = await fetch(url, {
         method: 'GET',
-        headers: { Accept: 'application/json' },
+        headers: { Accept: 'application/json', ...getTelegramAuthorizationHeaders() },
         signal: AbortSignal.timeout(2500),
       });
       const contentType = res.headers.get('content-type') || '';
@@ -769,7 +831,6 @@ export async function adminChangePlayerBalance(
         headers: {
           'Content-Type': 'application/json',
           Accept: 'application/json',
-          ...getTelegramAuthorizationHeader(),
         },
         body: JSON.stringify(params),
         signal: AbortSignal.timeout(3000),
@@ -1209,7 +1270,6 @@ export async function adminUpdateTransactionStatus(
         headers: {
           'Content-Type': 'application/json',
           Accept: 'application/json',
-          ...getTelegramAuthorizationHeader(),
         },
         body: JSON.stringify({ status, note }),
         signal: AbortSignal.timeout(3000),
@@ -1347,6 +1407,7 @@ export async function adminBroadcastMessage(
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
         Accept: 'application/json',
+        ...getTelegramAuthorizationHeaders(),
       };
       if (localBotToken) {
         headers['x-bot-token'] = localBotToken;

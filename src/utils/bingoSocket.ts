@@ -1,6 +1,8 @@
 import { io, Socket } from 'socket.io-client';
 import { BingoCardModel } from '../types';
-import { isStaticFrontendUrl, PRIMARY_LIVE_BACKEND } from './api';
+import { getBingoGuestSession, isStaticFrontendUrl, PRIMARY_LIVE_BACKEND, BingoGuestSession } from './api';
+
+export const GLOBAL_BINGO_ROOM_ID = 'GLOBAL_ROOM';
 
 export interface BingoRoomSnapshot {
   gameId: string;
@@ -19,6 +21,7 @@ export interface BingoRoomSnapshot {
 
 export interface BingoJoinResult {
   ok: boolean;
+  spectator?: boolean;
   error?: string;
   state?: BingoRoomSnapshot;
   cards?: BingoCardModel[];
@@ -47,6 +50,11 @@ export type BingoSocket = Socket;
 
 function getSocketBackendUrl() {
   if (typeof window !== 'undefined') {
+    const hostname = window.location.hostname.toLowerCase();
+    if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' || hostname === '[::1]') {
+      return window.location.origin;
+    }
+
     const envBackend = (import.meta as any).env?.VITE_SERVER_URL || (import.meta as any).env?.VITE_BACKEND_URL;
     if (envBackend && typeof envBackend === 'string' && envBackend.startsWith('http')) {
       return envBackend.replace(/\/$/, '');
@@ -82,21 +90,26 @@ function getSocketBackendUrl() {
   return PRIMARY_LIVE_BACKEND;
 }
 
-export function connectBingoSocket(initData: string): BingoSocket {
-  const safeInitData = initData || (() => {
-    if (typeof window === 'undefined') return '';
-    const existing = localStorage.getItem('salery_bingo_mock_tg_id');
-    const nextId = existing && !Number.isNaN(Number(existing)) ? String(existing) : String(Math.floor(100000000 + Math.random() * 900000000));
-    localStorage.setItem('salery_bingo_mock_tg_id', nextId);
-    return `mock:${nextId}`;
-  })();
-
+export function connectBingoSocket(
+  playerId: number | string,
+  onGuestSession?: (session: BingoGuestSession) => void
+): BingoSocket {
   return io(getSocketBackendUrl(), {
-    auth: { initData: safeInitData },
-    autoConnect: true,
+    path: '/socket.io',
+    auth: (callback) => {
+      void getBingoGuestSession().then((session) => {
+        onGuestSession?.(session);
+        callback({ playerId: String(session.playerId), guestToken: session.token });
+      }).catch((error: unknown) => {
+        console.error('Could not establish a secure bingo guest session:', error);
+        callback({ playerId: String(playerId), guestToken: '' });
+      });
+    },
+    autoConnect: false,
     reconnection: true,
-    reconnectionAttempts: 15,
+    reconnectionAttempts: Infinity,
     reconnectionDelay: 1000,
+    reconnectionDelayMax: 5000,
     transports: ['websocket', 'polling'],
   });
 }
@@ -104,10 +117,17 @@ export function connectBingoSocket(initData: string): BingoSocket {
 export function emitBingoWithAck<T>(
   socket: BingoSocket,
   event: string,
-  payload?: unknown
+  payload?: unknown,
+  timeoutMs = 10_000
 ): Promise<T> {
+  if (timeoutMs <= 0) {
+    return new Promise((resolve) => {
+      socket.emit(event, payload, (result: T) => resolve(result));
+    });
+  }
+
   return new Promise((resolve, reject) => {
-    socket.timeout(10_000).emit(event, payload, (error: Error | null, result: T) => {
+    socket.timeout(timeoutMs).emit(event, payload, (error: Error | null, result: T) => {
       if (error) reject(error);
       else resolve(result);
     });

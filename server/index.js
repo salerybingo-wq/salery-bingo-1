@@ -2,6 +2,7 @@
 import dotenv from "dotenv";
 import fs2 from "fs";
 import { createServer } from "node:http";
+import { randomInt } from "node:crypto";
 import express from "express";
 import cors from "cors";
 import { Server as SocketServer } from "socket.io";
@@ -85,19 +86,6 @@ var LocalSecureDatabase = class {
     this.data = this.loadData();
     this.persistedSignature = this.getDataSignature(this.data);
     this.ensureDefaultAdmin();
-  }
-  isLocalDevMode() {
-    return process.env.NODE_ENV !== "production" || process.env.LOCALHOST_TEST === "true" || process.env.VITE_DEV_SERVER === "true";
-  }
-  forceLocalDevBalance() {
-    if (!this.isLocalDevMode()) return;
-    Object.values(this.data.users).forEach((user) => {
-      if (user.role !== "admin") {
-        user.balance = 100;
-        user.updated_at = (/* @__PURE__ */ new Date()).toISOString();
-      }
-    });
-    this.persistSync();
   }
   getDataSignature(data) {
     const { updated_at, ...rest } = data;
@@ -189,13 +177,13 @@ var LocalSecureDatabase = class {
         full_name: "\u1233\u1208\u122A \u12A0\u12F5\u121A\u1295 (Admin)",
         username: "salery_admin",
         phone_number: "+251911000000",
-        balance: 24560,
+        balance: 0,
         role: "admin",
         status: "active",
         is_blocked: false,
         is_verified: true,
         referral_count: 0,
-        total_deposited: 5e4,
+        total_deposited: 0,
         total_withdrawn: 0,
         games_played: 15,
         games_won: 8,
@@ -212,7 +200,7 @@ var LocalSecureDatabase = class {
         full_name: "Jo_cr7 (@jo_cr7)",
         username: "jo_cr7",
         phone_number: "+251908336796",
-        balance: 10,
+        balance: 0,
         role: "user",
         status: "active",
         is_blocked: false,
@@ -239,7 +227,7 @@ var LocalSecureDatabase = class {
           full_name: p.full_name || p.first_name || "Player",
           username: p.username || "",
           phone_number: p.phone_number || "",
-          balance: p.balance ?? 1e3,
+          balance: p.balance ?? 0,
           role: "user",
           status: "active",
           is_blocked: false,
@@ -287,7 +275,7 @@ var LocalSecureDatabase = class {
       return updated;
     } else {
       const initialMain = user.main_wallet !== void 0 ? user.main_wallet : user.balance !== void 0 ? user.balance : 0;
-      const initialPlay = user.play_wallet !== void 0 ? user.play_wallet : 10;
+      const initialPlay = user.play_wallet !== void 0 ? user.play_wallet : 0;
       const newUser = {
         id: Date.now(),
         telegram_id: key,
@@ -537,6 +525,36 @@ var LocalSecureDatabase = class {
 };
 var localDb = new LocalSecureDatabase();
 
+// server/guestAuth.ts
+import { createHmac, timingSafeEqual } from "node:crypto";
+var LOCAL_TEST_BALANCE = 50;
+function minimumLocalTestBalance(...balances) {
+  const validBalances = balances.map(Number).filter((balance) => Number.isFinite(balance) && balance >= 0);
+  return Math.max(LOCAL_TEST_BALANCE, ...validBalances);
+}
+function getGuestSecret() {
+  const configuredSecret = process.env.BINGO_GUEST_SECRET || process.env.BOT_TOKEN || "";
+  if (configuredSecret.length >= 32) return configuredSecret;
+  if (process.env.NODE_ENV !== "production") return "local-bingo-guest-secret-change-before-deploy";
+  return "";
+}
+function signBingoGuestToken(playerId) {
+  const secret = getGuestSecret();
+  if (!secret) return null;
+  return createHmac("sha256", secret).update(`bingo-guest:${playerId}`).digest("hex");
+}
+function isValidBingoGuestToken(playerId, token) {
+  if (typeof token !== "string" || !/^[a-f0-9]{64}$/i.test(token)) return false;
+  const expected = signBingoGuestToken(playerId);
+  if (!expected) return false;
+  const providedBytes = Buffer.from(token, "hex");
+  const expectedBytes = Buffer.from(expected, "hex");
+  return providedBytes.length === expectedBytes.length && timingSafeEqual(providedBytes, expectedBytes);
+}
+
+// server/bingo.ts
+import { createHmac as createHmac2, timingSafeEqual as timingSafeEqual2 } from "node:crypto";
+
 // src/utils/bingoLogic.ts
 var BINGO_LETTERS = ["B", "I", "N", "G", "O"];
 function getLetterForNumber(num) {
@@ -752,8 +770,8 @@ var schemaSql = `
     full_name TEXT,
     username TEXT,
     phone_number TEXT,
-    balance NUMERIC DEFAULT 10,
-    main_wallet NUMERIC DEFAULT 10,
+    balance NUMERIC DEFAULT 0,
+    main_wallet NUMERIC DEFAULT 0,
     play_wallet NUMERIC DEFAULT 0,
     role TEXT DEFAULT 'user',
     status TEXT DEFAULT 'active',
@@ -761,6 +779,7 @@ var schemaSql = `
     ban_reason TEXT,
     is_verified BOOLEAN DEFAULT false,
     referred_by TEXT,
+    share_bonus_awarded BOOLEAN DEFAULT false,
     referral_count INTEGER DEFAULT 0,
     total_deposited NUMERIC DEFAULT 0,
     total_withdrawn NUMERIC DEFAULT 0,
@@ -771,11 +790,14 @@ var schemaSql = `
   );
   ALTER TABLE public.users ADD COLUMN IF NOT EXISTS main_wallet NUMERIC;
   ALTER TABLE public.users ADD COLUMN IF NOT EXISTS play_wallet NUMERIC;
+  ALTER TABLE public.users ADD COLUMN IF NOT EXISTS share_bonus_awarded BOOLEAN DEFAULT false;
   UPDATE public.users
     SET main_wallet = COALESCE(main_wallet, balance, 0),
         play_wallet = COALESCE(play_wallet, 0);
   ALTER TABLE public.users ALTER COLUMN main_wallet SET DEFAULT 0;
   ALTER TABLE public.users ALTER COLUMN play_wallet SET DEFAULT 0;
+  UPDATE public.users SET share_bonus_awarded = false WHERE share_bonus_awarded IS NULL;
+  ALTER TABLE public.users ALTER COLUMN share_bonus_awarded SET DEFAULT false;
   CREATE TABLE IF NOT EXISTS public.transactions (
     id TEXT PRIMARY KEY,
     telegram_id TEXT NOT NULL,
@@ -836,6 +858,14 @@ var schemaSql = `
     state JSONB NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
+  CREATE TABLE IF NOT EXISTS public.bingo_broadcasts (
+    id TEXT PRIMARY KEY,
+    message TEXT NOT NULL,
+    photo_url TEXT,
+    target TEXT NOT NULL,
+    sent_count INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
   CREATE TABLE IF NOT EXISTS public.bingo_wallet_ledger (
     idempotency_key TEXT PRIMARY KEY,
     telegram_id TEXT NOT NULL,
@@ -856,7 +886,7 @@ var schemaSql = `
 `;
 function getPool() {
   if (pool !== void 0) return pool;
-  const connectionString = process.env.DATABASE_URL || process.env.POSTGRES_URL || process.env.POSTGRES_PRISMA_URL || "";
+  const connectionString = process.env.SUPABASE_DB_URL || process.env.DATABASE_URL || process.env.POSTGRES_URL || process.env.POSTGRES_PRISMA_URL || "";
   pool = connectionString ? new Pool({
     connectionString,
     max: 3,
@@ -874,6 +904,33 @@ async function initializePostgres() {
   if (!client) return false;
   await ensureSchema(client);
   return true;
+}
+async function savePostgresBroadcast(broadcast) {
+  const client = getPool();
+  if (!client) return null;
+  await ensureSchema(client);
+  const result = await client.query(
+    `INSERT INTO public.bingo_broadcasts (id, message, photo_url, target, sent_count, created_at)
+     VALUES ($1, $2, $3, $4, $5, COALESCE($6::timestamptz, NOW()))
+     ON CONFLICT (id) DO UPDATE SET
+       message = EXCLUDED.message,
+       photo_url = EXCLUDED.photo_url,
+       target = EXCLUDED.target,
+       sent_count = EXCLUDED.sent_count
+     RETURNING *`,
+    [broadcast.id, broadcast.message, broadcast.photo_url || null, broadcast.target, broadcast.sent_count, broadcast.created_at || null]
+  );
+  return result.rows[0] || null;
+}
+async function getPostgresBroadcasts(limit = 200) {
+  const client = getPool();
+  if (!client) return null;
+  await ensureSchema(client);
+  const result = await client.query(
+    "SELECT id, message, photo_url, target, sent_count, created_at FROM public.bingo_broadcasts ORDER BY created_at DESC LIMIT $1",
+    [Math.max(1, Math.min(500, Math.floor(limit)))]
+  );
+  return result.rows;
 }
 async function ensureSchema(client) {
   if (!schemaReady) {
@@ -928,8 +985,8 @@ async function upsertPostgresUser(user) {
       user.full_name || "",
       user.username || "",
       user.phone_number || "",
-      Number(user.main_wallet ?? user.balance ?? 10),
-      Number(user.main_wallet ?? user.balance ?? 10),
+      Number(user.main_wallet ?? user.balance ?? 0),
+      Number(user.main_wallet ?? user.balance ?? 0),
       Number(user.play_wallet ?? 0),
       user.role || "user",
       user.status || "active",
@@ -965,6 +1022,13 @@ async function setPostgresUserWallets(telegramId, mainWallet, playWallet) {
     mainWallet: Number(result.rows[0].main_wallet),
     playWallet: Number(result.rows[0].play_wallet)
   };
+}
+async function getPostgresBingoRoom(roomId) {
+  const client = getPool();
+  if (!client) return null;
+  await ensureSchema(client);
+  const result = await client.query("SELECT state FROM public.bingo_rooms WHERE room_id = $1", [roomId]);
+  return result.rows[0]?.state || null;
 }
 async function joinPostgresBingoRoom(input) {
   const poolClient = getPool();
@@ -1012,7 +1076,23 @@ async function joinPostgresBingoRoom(input) {
         duplicate: true
       };
     }
-    if (state.status !== "waiting" && (state.status !== "in_progress" || state.called.length > 5)) {
+    if (state.status === "in_progress") {
+      const userResult = await client.query(
+        "SELECT balance, main_wallet, play_wallet FROM public.users WHERE telegram_id = $1",
+        [input.telegramId]
+      );
+      await client.query("COMMIT");
+      const account = userResult.rows[0];
+      return {
+        state,
+        balance: Number(account?.main_wallet ?? account?.balance ?? 0),
+        mainWallet: Number(account?.main_wallet ?? account?.balance ?? 0),
+        playWallet: Number(account?.play_wallet ?? 0),
+        duplicate: false,
+        spectator: true
+      };
+    }
+    if (state.status !== "waiting") {
       throw new Error("This game has already started");
     }
     const reserved = new Set(state.players.flatMap((player) => player.cardIds));
@@ -1040,7 +1120,7 @@ async function joinPostgresBingoRoom(input) {
       joinRequestId: input.joinRequestId
     });
     const commission = input.walletType === "main_wallet" ? Math.floor(cost * 0.2) : 0;
-    if (input.walletType === "main_wallet") state.prizePool += cost - commission;
+    state.prizePool += cost;
     await client.query(
       "INSERT INTO public.bingo_wallet_ledger (idempotency_key, telegram_id, game_id, kind, wallet_type, amount) VALUES ($1, $2, $3, 'stake', $4, $5)",
       [`stake:${state.gameId}:${input.telegramId}`, input.telegramId, state.gameId, input.walletType, cost]
@@ -1297,62 +1377,79 @@ async function deletePostgresTransaction(id) {
 }
 
 // server/bingo.ts
+var GLOBAL_ROOM_ID = "GLOBAL_ROOM";
+var ROOM_JOIN_WINDOW_MS = 35e3;
 var BALL_INTERVAL_MS = 3e3;
+var JOIN_GRACE_MS = 1e4;
+var JOIN_RETRY_MS = 250;
+var MAX_INIT_DATA_AGE_SECONDS = 86400;
 var VALID_STAKES = /* @__PURE__ */ new Set([10]);
-function validateTelegramInitData(initData, botToken, allowLocalMock = true) {
-  if (typeof initData === "string" && initData.startsWith("mock:")) {
-    const rawId = initData.slice(5).trim();
-    const parsedId = Number(rawId);
-    if (Number.isSafeInteger(parsedId) && parsedId > 0) {
-      return {
-        id: parsedId,
-        first_name: "Player",
-        username: `player_${String(parsedId).slice(-4)}`
-      };
-    }
-  }
-  if (!initData || initData.trim() === "") {
-    const mockId = Number(process.env.MOCK_TELEGRAM_USER_ID || 1000000001);
-    return {
-      id: Number.isSafeInteger(mockId) && mockId > 0 ? mockId : 1000000001,
-      first_name: "Player",
-      username: "player"
-    };
-  }
-  try {
-    const params = new URLSearchParams(initData);
-    const userJson = params.get("user");
-    if (userJson) {
-      const user = JSON.parse(userJson);
-      if (Number.isSafeInteger(Number(user.id)) && Number(user.id) > 0) {
-        return {
-          id: Number(user.id),
-          first_name: user.first_name || "Player",
-          username: user.username || `user_${user.id}`
-        };
-      }
-    }
-  } catch {
-  }
-  const fallbackId = Number(process.env.MOCK_TELEGRAM_USER_ID || 1000000001);
+function createLocalMockUser(idValue) {
+  const id = Number(idValue || process.env.MOCK_TELEGRAM_USER_ID || 1000000001);
+  if (!Number.isSafeInteger(id) || id <= 0) return null;
   return {
-    id: Number.isSafeInteger(fallbackId) && fallbackId > 0 ? fallbackId : 1000000001,
+    id,
     first_name: "Player",
-    username: "player"
+    username: `player_${String(id).slice(-4)}`
   };
 }
+function isLoopbackAddress(address) {
+  const normalized = (address || "").toLowerCase().replace(/^::ffff:/, "");
+  return normalized === "::1" || normalized === "127.0.0.1" || normalized.startsWith("127.");
+}
+function isLoopbackClientAllowed(origin, remoteAddress) {
+  if (!isLoopbackAddress(remoteAddress)) return false;
+  try {
+    const hostname = new URL(origin || "").hostname.toLowerCase();
+    return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1";
+  } catch {
+    return false;
+  }
+}
+function validateTelegramInitData(initData, botToken, allowLocalMock = false) {
+  const rawInitData = typeof initData === "string" ? initData.trim() : "";
+  if (rawInitData.startsWith("mock:")) {
+    return allowLocalMock ? createLocalMockUser(rawInitData.slice(5)) : null;
+  }
+  if (!rawInitData) return allowLocalMock ? createLocalMockUser() : null;
+  if (!botToken) return null;
+  try {
+    const params = new URLSearchParams(rawInitData);
+    const hash = params.get("hash") || "";
+    const authDate = Number(params.get("auth_date"));
+    const now = Math.floor(Date.now() / 1e3);
+    if (!/^[a-f0-9]{64}$/i.test(hash) || !Number.isSafeInteger(authDate)) return null;
+    if (authDate > now + 60 || now - authDate > MAX_INIT_DATA_AGE_SECONDS) return null;
+    const dataCheckString = Array.from(params.entries()).filter(([key]) => key !== "hash").sort(([left], [right]) => left.localeCompare(right)).map(([key, value]) => `${key}=${value}`).join("\n");
+    const secretKey = createHmac2("sha256", "WebAppData").update(botToken).digest();
+    const expectedHash = createHmac2("sha256", secretKey).update(dataCheckString).digest();
+    const suppliedHash = Buffer.from(hash, "hex");
+    if (suppliedHash.length !== expectedHash.length || !timingSafeEqual2(suppliedHash, expectedHash)) return null;
+    const userJson = params.get("user");
+    if (!userJson) return null;
+    const user = JSON.parse(userJson);
+    if (!Number.isSafeInteger(Number(user.id)) || Number(user.id) <= 0) return null;
+    return {
+      id: Number(user.id),
+      first_name: user.first_name || "Player",
+      last_name: user.last_name,
+      username: user.username || `user_${user.id}`
+    };
+  } catch {
+    return null;
+  }
+}
 function getNextAlignedStartsAt(now = Date.now()) {
-  const cycleIndex = Math.floor(now / 35e3);
-  const cycleStart = cycleIndex * 35e3;
-  let target = cycleStart + 35e3;
+  const cycleIndex = Math.floor(now / ROOM_JOIN_WINDOW_MS);
+  const cycleStart = cycleIndex * ROOM_JOIN_WINDOW_MS;
+  let target = cycleStart + ROOM_JOIN_WINDOW_MS;
   if (target <= now + 1500) {
-    target = (cycleIndex + 1) * 35e3 + 35e3;
+    target = (cycleIndex + 1) * ROOM_JOIN_WINDOW_MS + ROOM_JOIN_WINDOW_MS;
   }
   return target;
 }
-function makeRoomState(stake) {
-  const startsAt = getNextAlignedStartsAt();
-  const cycleIndex = Math.floor(startsAt / 35e3);
+function makeRoomState(stake, startsAt = getNextAlignedStartsAt()) {
+  const cycleIndex = Math.floor(startsAt / ROOM_JOIN_WINDOW_MS);
   return {
     gameId: `salery-live-${cycleIndex}`,
     stake,
@@ -1364,14 +1461,15 @@ function makeRoomState(stake) {
     players: []
   };
 }
-function roomIdForStake(stake = 10) {
-  const safeStake = VALID_STAKES.has(Number(stake)) ? Number(stake) : 10;
-  return `bingo:stake:${safeStake}`;
+function roomIdForStake(_stake = 10) {
+  return GLOBAL_ROOM_ID;
 }
 function publicRoomState(state, onlineIds = /* @__PURE__ */ new Set()) {
   const onlinePlayers = new Set(onlineIds);
-  const totalCards = state.players.reduce((total, p) => total + (p.cardIds?.length || 1), 0);
-  const calculatedPrize = Math.floor(Math.max(totalCards, 1) * state.stake * 0.8);
+  const playersWithCartelas = state.players.filter((player) => player.cardIds.length > 0);
+  const totalCards = playersWithCartelas.reduce((total, player) => total + player.cardIds.length, 0);
+  const collectedBets = totalCards * state.stake;
+  const calculatedPrize = Math.floor(collectedBets * 0.8);
   const takenCartelas = {};
   state.players.forEach((p) => {
     p.cardIds?.forEach((cid) => {
@@ -1383,12 +1481,13 @@ function publicRoomState(state, onlineIds = /* @__PURE__ */ new Set()) {
     stake: state.stake,
     status: state.status,
     startsAt: state.startsAt,
+    serverNow: Date.now(),
     called: state.called,
     prizePool: calculatedPrize,
-    playerCount: Math.max(state.players.length, 1),
+    playerCount: playersWithCartelas.length,
     totalCards,
     takenCartelas,
-    players: state.players.map(({ telegramId, name, cardIds }) => ({
+    players: playersWithCartelas.map(({ telegramId, name, cardIds }) => ({
       name,
       cardsCount: cardIds.length,
       isOnline: onlinePlayers.has(telegramId)
@@ -1396,7 +1495,7 @@ function publicRoomState(state, onlineIds = /* @__PURE__ */ new Set()) {
     winnerId: state.winnerId,
     winnerName: state.players.find((player) => player.telegramId === state.winnerId)?.name,
     winningCardId: state.winningCardId,
-    prize: state.prize || calculatedPrize
+    prize: state.prize ?? calculatedPrize
   };
 }
 function getOnlinePlayerIds(io, roomId) {
@@ -1409,11 +1508,16 @@ function getOnlinePlayerIds(io, roomId) {
   return onlineIds;
 }
 function sendRoomState(io, roomId, state) {
-  io.to(roomId).emit("room:state", publicRoomState(state, getOnlinePlayerIds(io, roomId)));
+  const publicState = publicRoomState(state, getOnlinePlayerIds(io, roomId));
+  io.to(roomId).emit("room:state", publicState);
+  io.to(roomId).emit("room:selection_state", publicState);
 }
-function attachBingoRooms(io, botToken) {
+function attachBingoRooms(io) {
   const localRooms = /* @__PURE__ */ new Map();
   const activeTimers = /* @__PURE__ */ new Map();
+  const countdownTimers = /* @__PURE__ */ new Map();
+  const activeDrawTimers = /* @__PURE__ */ new Map();
+  let globalRoomInitialization = null;
   const cartelaReservations = {
     10: {},
     25: {},
@@ -1423,10 +1527,28 @@ function attachBingoRooms(io, botToken) {
   };
   const broadcastCartelaReservations = (stake) => {
     const roomId = roomIdForStake(stake);
-    io.to(roomId).emit("cartela:reserved_list", {
-      stake,
-      takenCartelas: cartelaReservations[stake] || {}
+    const takenCartelas = {};
+    const state = localRooms.get(roomId);
+    state?.players.forEach((joinedPlayer) => {
+      joinedPlayer.cardIds.forEach((cardId) => {
+        takenCartelas[cardId] = joinedPlayer.name || "Player";
+      });
     });
+    Object.entries(cartelaReservations[stake] || {}).forEach(([cardId, reservation]) => {
+      if (!takenCartelas[Number(cardId)]) takenCartelas[Number(cardId)] = reservation.name;
+    });
+    const reservedList = {
+      stake,
+      takenCartelas,
+      totalCards: Object.keys(takenCartelas).length,
+      playerCount: new Set(
+        Object.values(cartelaReservations[stake] || {}).map(({ playerId }) => playerId).concat((state?.players || []).map(({ telegramId }) => telegramId))
+      ).size,
+      prizePool: Math.floor(
+        Object.keys(takenCartelas).length * (state?.stake ?? stake) * 0.8
+      )
+    };
+    io.to(roomId).emit("cartela:reserved_list", reservedList);
   };
   function findRoomWinner(room) {
     const calledSet = new Set(room.called);
@@ -1449,6 +1571,36 @@ function attachBingoRooms(io, botToken) {
     return null;
   }
   const resetTimers = /* @__PURE__ */ new Map();
+  const startSelectionRound = async (roomId, stake) => {
+    const activeTimer = activeTimers.get(roomId);
+    if (activeTimer) {
+      clearTimeout(activeTimer);
+      activeTimers.delete(roomId);
+    }
+    const countdown = countdownTimers.get(roomId);
+    if (countdown) {
+      clearInterval(countdown);
+      countdownTimers.delete(roomId);
+    }
+    const drawTimer = activeDrawTimers.get(roomId);
+    if (drawTimer) {
+      clearInterval(drawTimer);
+      activeDrawTimers.delete(roomId);
+    }
+    const nextState = makeRoomState(stake, Date.now() + ROOM_JOIN_WINDOW_MS);
+    localRooms.set(roomId, nextState);
+    cartelaReservations[stake] = {};
+    broadcastCartelaReservations(stake);
+    if (await isPostgresConfigured()) {
+      try {
+        await mutatePostgresBingoRoom(roomId, () => nextState);
+      } catch (error) {
+        console.error(`Could not persist selection round for ${roomId}:`, error);
+      }
+    }
+    sendRoomState(io, roomId, nextState);
+    scheduleRoom(roomId, nextState);
+  };
   const scheduleRoomReset = (roomId) => {
     if (resetTimers.has(roomId)) {
       clearTimeout(resetTimers.get(roomId));
@@ -1458,15 +1610,26 @@ function attachBingoRooms(io, botToken) {
       resetTimers.delete(roomId);
       const currentRoom = localRooms.get(roomId);
       if (currentRoom && currentRoom.status === "finished") {
-        const newState = makeRoomState(currentRoom.stake);
-        localRooms.set(roomId, newState);
-        sendRoomState(io, roomId, newState);
-        scheduleRoom(roomId, newState);
+        void startSelectionRound(roomId, currentRoom.stake);
       }
     }, 5e3);
     resetTimers.set(roomId, timer);
   };
   const startRoomGame = async (roomId, latest) => {
+    console.log("[DRAW] startRoomGame requested:", {
+      roomId,
+      status: latest.status,
+      playerCount: latest.players.length,
+      calledCount: latest.called.length
+    });
+    if (latest.status === "finished" || latest.players.length === 0) {
+      console.log("[DRAW] Not starting loop: room is finished or has no players.", roomId);
+      return;
+    }
+    if (activeDrawTimers.has(roomId)) {
+      console.log("[DRAW] Draw loop already active:", roomId);
+      return;
+    }
     if (activeTimers.has(roomId)) {
       clearTimeout(activeTimers.get(roomId));
       activeTimers.delete(roomId);
@@ -1475,50 +1638,101 @@ function attachBingoRooms(io, botToken) {
       clearTimeout(resetTimers.get(roomId));
       resetTimers.delete(roomId);
     }
-    const totalRoomCards = latest.players.reduce((total, p) => total + (p.cardIds?.length || 1), 0);
-    latest.prizePool = Math.floor(Math.max(totalRoomCards, 1) * latest.stake * 0.8);
-    latest.status = "in_progress";
-    latest.startsAt = Date.now();
-    localRooms.set(roomId, latest);
-    if (await isPostgresConfigured()) {
-      await mutatePostgresBingoRoom(roomId, () => latest);
+    if (countdownTimers.has(roomId)) {
+      clearInterval(countdownTimers.get(roomId));
+      countdownTimers.delete(roomId);
     }
-    io.to(roomId).emit("gameStarted", {
-      gameId: latest.gameId,
-      startedAt: latest.startsAt
-    });
+    const totalRoomCards = latest.players.reduce((total, player) => total + player.cardIds.length, 0);
+    latest.prizePool = totalRoomCards * latest.stake;
+    const alreadyInProgress = String(latest.status).toLowerCase() === "in_progress";
+    if (!alreadyInProgress) {
+      latest.status = "in_progress";
+      latest.startsAt = Date.now();
+    }
+    localRooms.set(roomId, latest);
+    if (!alreadyInProgress) {
+      io.to(roomId).emit("gameStarted", {
+        gameId: latest.gameId,
+        startedAt: latest.startsAt
+      });
+    }
     sendRoomState(io, roomId, latest);
-    const callNextBall = () => {
-      const loopTimer = setTimeout(async () => {
-        let room = localRooms.get(roomId);
+    if (!alreadyInProgress && isPostgresConfigured()) {
+      void mutatePostgresBingoRoom(roomId, () => latest).catch((error) => {
+        console.error(`Could not persist game start for ${roomId}; continuing with the active room state:`, error);
+      });
+    }
+    const startDrawLoop = (drawRoomId, roomState) => {
+      console.log("[DRAW] Starting draw loop:", {
+        roomId: drawRoomId,
+        status: roomState.status,
+        playerCount: roomState.players.length
+      });
+      if (activeDrawTimers.has(drawRoomId)) {
+        console.log("[DRAW] Draw loop already active:", drawRoomId);
+        return;
+      }
+      const drawBall = async () => {
+        let room = localRooms.get(drawRoomId);
         if (!room || room.status !== "in_progress") {
-          activeTimers.delete(roomId);
+          const currentTimer = activeDrawTimers.get(drawRoomId);
+          if (currentTimer) clearInterval(currentTimer);
+          activeDrawTimers.delete(drawRoomId);
           return;
         }
         if (room.deck.length === 0) {
           room.status = "finished";
-          localRooms.set(roomId, room);
-          sendRoomState(io, roomId, room);
-          scheduleRoomReset(roomId);
+          localRooms.set(drawRoomId, room);
+          const finishedTimer = activeDrawTimers.get(drawRoomId);
+          if (finishedTimer) clearInterval(finishedTimer);
+          activeDrawTimers.delete(drawRoomId);
+          sendRoomState(io, drawRoomId, room);
+          scheduleRoomReset(drawRoomId);
           return;
         }
-        const nextNum = room.deck.shift();
-        room.called.push(nextNum);
-        localRooms.set(roomId, room);
-        if (await isPostgresConfigured()) {
-          await mutatePostgresBingoRoom(roomId, () => room);
+        const currentBall = room.deck.shift();
+        room.called.push(currentBall);
+        localRooms.set(drawRoomId, room);
+        const ball = {
+          number: currentBall,
+          gameId: room.gameId,
+          drawnAt: Date.now()
+        };
+        console.log("[DRAW] Ball drawn; broadcasting:", {
+          roomId: drawRoomId,
+          ball,
+          calledCount: room.called.length
+        });
+        const payload = {
+          ball,
+          number: currentBall,
+          calledNumbers: [...room.called],
+          called: [...room.called],
+          gameId: room.gameId,
+          drawnAt: ball.drawnAt
+        };
+        io.to(drawRoomId).emit("room:number_drawn", payload);
+        io.emit("room:number_drawn", payload);
+        if (isPostgresConfigured()) {
+          void mutatePostgresBingoRoom(drawRoomId, () => room).catch((error) => {
+            console.error(`Could not persist drawn number ${currentBall} for ${drawRoomId}; continuing the draw:`, error);
+          });
         }
         const winner = findRoomWinner(room);
         if (winner) {
           room.status = "finished";
+          const winnerTimer = activeDrawTimers.get(drawRoomId);
+          if (winnerTimer) clearInterval(winnerTimer);
+          activeDrawTimers.delete(drawRoomId);
           room.winnerId = String(winner.player.telegramId);
           room.winningCardId = winner.cardId;
-          const totalCardsNow = room.players.reduce((total, p) => total + (p.cardIds?.length || 1), 0);
-          const prize = Math.floor(Math.max(totalCardsNow, 1) * room.stake * 0.8);
+          const totalCardsNow = room.players.reduce((total, player) => total + player.cardIds.length, 0);
+          const prize = Math.floor(totalCardsNow * room.stake * 0.8);
           room.prize = prize;
           let finalBal = 0;
           let finalMain = 0;
           let finalPlay = 0;
+          let payoutVerified = false;
           try {
             if (await isPostgresConfigured()) {
               const pgResult = await awardPostgresBingoPrize(roomId, String(winner.player.telegramId), winner.cardId, prize);
@@ -1527,115 +1741,181 @@ function attachBingoRooms(io, botToken) {
                 finalMain = pgResult.mainWallet;
                 finalPlay = pgResult.playWallet;
                 room = pgResult.state;
+                payoutVerified = true;
               }
             } else {
-              let localUser = localDb.data.users[String(winner.player.telegramId)];
+              let localUser = localDb.getUser(String(winner.player.telegramId));
               if (!localUser) {
                 localUser = localDb.upsertUser({
                   telegram_id: String(winner.player.telegramId),
                   first_name: winner.player.name || "Player",
                   username: `player_${winner.player.telegramId}`,
-                  balance: 500,
-                  main_wallet: 500,
+                  balance: 0,
+                  main_wallet: 0,
                   play_wallet: 0
                 });
               }
               if (localUser) {
                 const mainWallet = (localUser.main_wallet ?? localUser.balance ?? 0) + prize;
                 const playWallet = localUser.play_wallet ?? 0;
-                localUser.balance = mainWallet;
-                localUser.main_wallet = mainWallet;
-                localUser.games_won = (localUser.games_won || 0) + 1;
-                localDb.scheduleSave();
+                localDb.upsertUser({
+                  ...localUser,
+                  balance: mainWallet,
+                  main_wallet: mainWallet,
+                  games_won: (localUser.games_won || 0) + 1
+                });
                 finalBal = mainWallet;
                 finalMain = mainWallet;
                 finalPlay = playWallet;
+                payoutVerified = true;
               }
             }
           } catch (err) {
             console.error("Error awarding bingo in loop:", err);
           }
-          localRooms.set(roomId, room);
-          const currentTimer = activeTimers.get(roomId);
-          if (currentTimer) {
-            clearTimeout(currentTimer);
-            activeTimers.delete(roomId);
-          }
+          localRooms.set(drawRoomId, room);
           cartelaReservations[room.stake] = {};
           broadcastCartelaReservations(room.stake);
-          const publicState = publicRoomState(room, getOnlinePlayerIds(io, roomId));
-          io.to(roomId).emit("room:state", publicState);
           io.to(roomId).emit("room:winner", {
             gameId: room.gameId,
             winnerId: String(winner.player.telegramId),
             winnerName: winner.player.name || "Winner",
             cardId: winner.cardId,
             prize,
-            balance: finalBal,
-            mainWallet: finalMain,
-            playWallet: finalPlay,
+            ...payoutVerified ? {
+              balance: finalBal,
+              mainWallet: finalMain,
+              playWallet: finalPlay
+            } : {},
             win: winner.win
           });
-          scheduleRoomReset(roomId);
+          sendRoomState(io, drawRoomId, room);
+          scheduleRoomReset(drawRoomId);
           return;
         }
-        io.to(roomId).emit("numberDrawn", {
-          number: nextNum,
-          called: room.called,
-          gameId: room.gameId
-        });
-        sendRoomState(io, roomId, room);
-        callNextBall();
+        sendRoomState(io, drawRoomId, room);
+      };
+      const drawTimer = setInterval(() => {
+        void drawBall();
       }, BALL_INTERVAL_MS);
-      activeTimers.set(roomId, loopTimer);
+      activeDrawTimers.set(drawRoomId, drawTimer);
+      void drawBall();
     };
-    callNextBall();
+    startDrawLoop(roomId, latest);
   };
   const scheduleRoom = (roomId, state) => {
     if (activeTimers.has(roomId)) return;
-    const delay = Math.max(0, state.startsAt - Date.now()) + 1200;
-    const timer = setTimeout(async () => {
-      activeTimers.delete(roomId);
+    const broadcastTick = () => {
       const latest = localRooms.get(roomId);
       if (!latest || latest.status !== "waiting") return;
-      if (latest.players.length === 0) {
-        latest.startsAt = getNextAlignedStartsAt();
-        const cycleIndex = Math.floor(latest.startsAt / 35e3);
-        latest.gameId = `salery-live-${cycleIndex}`;
-        localRooms.set(roomId, latest);
-        sendRoomState(io, roomId, latest);
-        scheduleRoom(roomId, latest);
+      io.to(roomId).emit("room:tick", {
+        gameId: latest.gameId,
+        status: latest.status,
+        startsAt: latest.startsAt,
+        serverNow: Date.now(),
+        secondsRemaining: Math.max(0, Math.ceil((latest.startsAt - Date.now()) / 1e3))
+      });
+    };
+    broadcastTick();
+    const countdown = setInterval(broadcastTick, 1e3);
+    countdownTimers.set(roomId, countdown);
+    const finalizeSelection = async () => {
+      const latest = localRooms.get(roomId);
+      if (!latest || latest.status === "finished") return;
+      if (latest.status === "in_progress") {
+        await startRoomGame(roomId, latest);
         return;
       }
-      await startRoomGame(roomId, latest);
+      if (latest.players.length > 0) {
+        await startRoomGame(roomId, latest);
+        return;
+      }
+      const hasPendingReservations = Object.keys(cartelaReservations[latest.stake] || {}).length > 0;
+      if (hasPendingReservations && Date.now() < latest.startsAt + JOIN_GRACE_MS) {
+        const retry = setTimeout(() => {
+          activeTimers.delete(roomId);
+          void finalizeSelection();
+        }, JOIN_RETRY_MS);
+        activeTimers.set(roomId, retry);
+        return;
+      }
+      await startSelectionRound(roomId, latest.stake);
+    };
+    const delay = Math.max(0, state.startsAt - Date.now());
+    const timer = setTimeout(async () => {
+      activeTimers.delete(roomId);
+      const currentCountdown = countdownTimers.get(roomId);
+      if (currentCountdown) {
+        clearInterval(currentCountdown);
+        countdownTimers.delete(roomId);
+      }
+      await finalizeSelection();
     }, delay);
     activeTimers.set(roomId, timer);
   };
+  const ensureGlobalRoom = () => {
+    if (!localRooms.has(GLOBAL_ROOM_ID)) {
+      globalRoomInitialization ??= getPostgresBingoRoom(GLOBAL_ROOM_ID).catch((error) => {
+        console.warn("Could not restore the global bingo room:", error);
+        return null;
+      }).then((storedState) => {
+        const initialState = storedState || makeRoomState(10, Date.now() + ROOM_JOIN_WINDOW_MS);
+        localRooms.set(GLOBAL_ROOM_ID, initialState);
+        if (initialState.status === "waiting") scheduleRoom(GLOBAL_ROOM_ID, initialState);
+        else if (initialState.status === "in_progress") void startRoomGame(GLOBAL_ROOM_ID, initialState);
+        else if (initialState.status === "finished") scheduleRoomReset(GLOBAL_ROOM_ID);
+        return initialState;
+      });
+    }
+    return Promise.resolve(localRooms.get(GLOBAL_ROOM_ID) || globalRoomInitialization);
+  };
   io.use((socket, next) => {
     const auth = socket.handshake.auth || {};
-    const initData = auth.initData;
-    const user = validateTelegramInitData(initData, botToken);
-    if (!user) {
-      return next(new Error("Authentication failed: Invalid telegram hash"));
+    const playerId = Number(auth.playerId);
+    if (!Number.isSafeInteger(playerId) || playerId <= 0 || !isValidBingoGuestToken(playerId, auth.guestToken)) {
+      return next(new Error("A valid signed bingo guest session is required"));
     }
     const client = socket;
     client.data = {
-      player: user,
-      localDevMode: typeof initData === "string" && initData.startsWith("mock:")
+      player: {
+        id: playerId,
+        first_name: "Player",
+        username: `player_${String(playerId).slice(-4)}`
+      }
     };
     next();
   });
   io.on("connection", (socket) => {
     const client = socket;
     const player = client.data.player;
-    const playerIdentifier = String(player.username || player.id);
+    const playerIdentifier = String(player.id);
+    console.log("[SOCKET] Client connected:", {
+      socketId: client.id,
+      playerId: playerIdentifier,
+      roomId: GLOBAL_ROOM_ID
+    });
+    const roomMembership = Promise.resolve(client.join(GLOBAL_ROOM_ID));
+    void Promise.all([roomMembership, ensureGlobalRoom()]).then(([, state]) => {
+      console.log("[SOCKET] Global room synchronized:", {
+        socketId: client.id,
+        roomId: GLOBAL_ROOM_ID,
+        status: state.status,
+        playerCount: state.players.length
+      });
+      if (state.status === "in_progress") {
+        void startRoomGame(GLOBAL_ROOM_ID, state);
+      }
+      sendRoomState(io, GLOBAL_ROOM_ID, state);
+    }).catch((error) => {
+      console.error(`Could not initialize ${GLOBAL_ROOM_ID} for socket ${client.id}:`, error);
+    });
     client.on("cartela:room_enter", async (payload, ack) => {
+      await Promise.all([roomMembership, ensureGlobalRoom()]);
       const stake = Number(payload?.stake) || 10;
       const roomId = roomIdForStake(stake);
-      await client.join(roomId);
       let state = localRooms.get(roomId);
       if (!state || state.status === "finished") {
-        state = makeRoomState(stake);
+        state = makeRoomState(stake, Date.now() + ROOM_JOIN_WINDOW_MS);
         localRooms.set(roomId, state);
         scheduleRoom(roomId, state);
       }
@@ -1643,7 +1923,7 @@ function attachBingoRooms(io, botToken) {
       broadcastCartelaReservations(stake);
       const existingPlayer = state.players.find((p) => String(p.telegramId) === String(player.id));
       const userRes = cartelaReservations[stake] || {};
-      const myReservedCardIds = Object.entries(userRes).filter(([_, name]) => name === playerIdentifier || name === player.username).map(([cid]) => Number(cid));
+      const myReservedCardIds = Object.entries(userRes).filter(([, reservation]) => reservation.playerId === playerIdentifier).map(([cid]) => Number(cid));
       if (typeof ack === "function") {
         ack({
           ok: true,
@@ -1657,63 +1937,147 @@ function attachBingoRooms(io, botToken) {
         });
       }
     });
-    client.on("cartela:reserve", (payload) => {
+    client.on("cartela:reserve", async (payload, ack) => {
+      await Promise.all([roomMembership, ensureGlobalRoom()]);
       const stake = Number(payload.stake);
       const cardIds = Array.isArray(payload.cardIds) ? payload.cardIds : [];
-      if (!VALID_STAKES.has(stake)) return;
+      if (!VALID_STAKES.has(stake)) {
+        if (typeof ack === "function") ack({ ok: false, acceptedIds: [], error: "Invalid stake" });
+        return;
+      }
+      const state = localRooms.get(GLOBAL_ROOM_ID);
+      if (!state || state.status !== "waiting") {
+        if (typeof ack === "function") ack({ ok: false, acceptedIds: [], error: "Cartela selection is closed" });
+        return;
+      }
       const userRes = cartelaReservations[stake] || {};
-      for (const [cidStr, name] of Object.entries(userRes)) {
-        if (name === playerIdentifier || name === player.username) {
+      const validCardIds = Array.from(new Set(cardIds.filter(
+        (id) => Number.isInteger(id) && id >= 1 && id <= 400
+      )));
+      for (const [cidStr, reservation] of Object.entries(userRes)) {
+        if (reservation.playerId === playerIdentifier && !validCardIds.includes(Number(cidStr))) {
           delete userRes[Number(cidStr)];
         }
       }
-      cardIds.forEach((id) => {
-        userRes[id] = playerIdentifier;
+      const purchasedCardIds = new Set(state.players.flatMap((roomPlayer) => roomPlayer.cardIds));
+      const acceptedIds = [];
+      const rejectedIds = [];
+      validCardIds.forEach((id) => {
+        const reservation = userRes[id];
+        if (purchasedCardIds.has(id) || reservation && reservation.playerId !== playerIdentifier) {
+          rejectedIds.push(id);
+          return;
+        }
+        userRes[id] = {
+          playerId: playerIdentifier,
+          name: player.first_name || player.username || "Player"
+        };
+        acceptedIds.push(id);
       });
       cartelaReservations[stake] = userRes;
       broadcastCartelaReservations(stake);
+      sendRoomState(io, GLOBAL_ROOM_ID, state);
+      if (typeof ack === "function") ack({ ok: true, acceptedIds, rejectedIds });
     });
     client.on("cartela:release", (payload) => {
       const stake = Number(payload.stake);
       if (!VALID_STAKES.has(stake)) return;
       const userRes = cartelaReservations[stake] || {};
-      for (const [cidStr, name] of Object.entries(userRes)) {
-        if (name === playerIdentifier || name === player.username) {
+      for (const [cidStr, reservation] of Object.entries(userRes)) {
+        if (reservation.playerId === playerIdentifier) {
           delete userRes[Number(cidStr)];
         }
       }
       cartelaReservations[stake] = userRes;
       broadcastCartelaReservations(stake);
+      const state = localRooms.get(GLOBAL_ROOM_ID);
+      if (state) sendRoomState(io, GLOBAL_ROOM_ID, state);
     });
     client.on("room:join", async (payload, ack) => {
+      await Promise.all([roomMembership, ensureGlobalRoom()]);
       const stake = Number(payload?.stake) || 10;
-      const cardIds = Array.isArray(payload?.cardIds) && payload.cardIds.length > 0 ? payload.cardIds : [1];
+      const cardIds = Array.isArray(payload?.cardIds) ? payload.cardIds : [];
+      console.log("[ROOM] Join request received:", {
+        socketId: client.id,
+        playerId: playerIdentifier,
+        roomId: GLOBAL_ROOM_ID,
+        stake,
+        cardIds
+      });
+      if (!VALID_STAKES.has(stake)) {
+        return ack({ ok: false, error: "Invalid stake or cartela selection" });
+      }
       const walletType = payload?.walletType || "main_wallet";
       const roomId = roomIdForStake(stake);
-      await client.join(roomId);
       let state = localRooms.get(roomId);
       if (!state || state.status === "finished") {
-        state = makeRoomState(stake);
+        state = makeRoomState(stake, Date.now() + ROOM_JOIN_WINDOW_MS);
         localRooms.set(roomId, state);
         scheduleRoom(roomId, state);
       }
-      const cost = stake * cardIds.length;
       const existingJoin = state.players.find((p) => String(p.telegramId) === String(player.id));
       if (existingJoin) {
+        let mainWallet = 0;
+        let playWallet = 0;
+        if (await isPostgresConfigured()) {
+          const account = await getPostgresUser(String(player.id));
+          if (!account) return ack({ ok: false, error: "Local player wallet is unavailable" });
+          mainWallet = Number(account.main_wallet ?? account.balance ?? 0);
+          playWallet = Number(account.play_wallet ?? 0);
+        } else {
+          const account = localDb.getUser(String(player.id));
+          if (!account) return ack({ ok: false, error: "Local player wallet is unavailable" });
+          mainWallet = Number(account.main_wallet ?? account.balance ?? 0);
+          playWallet = Number(account.play_wallet ?? 0);
+        }
         const clientCards = existingJoin.cardIds.map((id) => generateCartelaByNumber(id));
+        if (state.status === "in_progress") void startRoomGame(roomId, state);
         return ack({
           ok: true,
           duplicate: true,
           state: publicRoomState(state, getOnlinePlayerIds(io, roomId)),
           cards: clientCards,
-          balance: 0
+          balance: mainWallet,
+          mainWallet,
+          playWallet
         });
       }
+      if (state.status === "in_progress") {
+        void startRoomGame(roomId, state);
+        return ack({
+          ok: true,
+          spectator: true,
+          state: publicRoomState(state, getOnlinePlayerIds(io, roomId))
+        });
+      }
+      if (payload?.rejoin) {
+        return ack({ ok: false, error: "No active cartela ticket exists for this round" });
+      }
+      if (cardIds.length === 0) return ack({ ok: false, error: "Select at least one cartela" });
+      if (cardIds.some((id) => !Number.isInteger(id) || id < 1 || id > 400) || new Set(cardIds).size !== cardIds.length) {
+        return ack({ ok: false, error: "Invalid stake or cartela selection" });
+      }
+      if (state.status !== "waiting") {
+        return ack({ ok: false, error: "Cartela selection is closed" });
+      }
+      const cost = stake * cardIds.length;
       try {
         let finalBal = 0;
         let finalMain = 0;
         let finalPlay = 0;
         if (await isPostgresConfigured()) {
+          const account = await getPostgresUser(String(player.id));
+          if (!account) {
+            await upsertPostgresUser({
+              telegram_id: String(player.id),
+              first_name: player.first_name || player.username || "Player",
+              full_name: player.first_name || player.username || "Player",
+              username: player.username || `player_${player.id}`,
+              balance: 0,
+              main_wallet: 0,
+              play_wallet: 0
+            });
+          }
           const pgResult = await joinPostgresBingoRoom({
             roomId,
             telegramId: String(player.id),
@@ -1729,32 +2093,34 @@ function attachBingoRooms(io, botToken) {
           finalMain = pgResult.mainWallet;
           finalPlay = pgResult.playWallet;
           state = pgResult.state;
+          if (pgResult.spectator) {
+            localRooms.set(roomId, state);
+            void startRoomGame(roomId, state);
+            return ack({
+              ok: true,
+              spectator: true,
+              state: publicRoomState(state, getOnlinePlayerIds(io, roomId))
+            });
+          }
         } else {
-          let localUser = localDb.data.users[String(player.id)];
+          let localUser = localDb.getUser(String(player.id));
           if (!localUser) {
             localUser = localDb.upsertUser({
               telegram_id: String(player.id),
               first_name: player.first_name || player.username || "Player",
               username: player.username || `player_${player.id}`,
-              balance: 500,
-              main_wallet: 500,
+              balance: 0,
+              main_wallet: 0,
               play_wallet: 0
             });
           }
-          let mainWallet = localUser.main_wallet ?? localUser.balance ?? 0;
-          let playWallet = localUser.play_wallet ?? 0;
+          let mainWallet = Number(localUser.main_wallet ?? localUser.balance ?? 0);
+          let playWallet = Number(localUser.play_wallet ?? 0);
           if (walletType === "play_wallet") {
-            if (playWallet < cost) {
-              playWallet = Math.max(playWallet, cost + 50);
-              localUser.play_wallet = playWallet;
-            }
+            if (playWallet < cost) return ack({ ok: false, error: "Insufficient balance or account unavailable" });
             playWallet -= cost;
           } else {
-            if (mainWallet < cost) {
-              mainWallet = Math.max(mainWallet, cost + 100);
-              localUser.main_wallet = mainWallet;
-              localUser.balance = mainWallet;
-            }
+            if (mainWallet < cost) return ack({ ok: false, error: "Insufficient balance or account unavailable" });
             mainWallet -= cost;
           }
           localUser.balance = mainWallet;
@@ -1773,13 +2139,19 @@ function attachBingoRooms(io, botToken) {
             stake,
             joinRequestId: payload?.joinRequestId || crypto.randomUUID()
           });
-          const totalCards = state.players.reduce((total, p) => total + (p.cardIds?.length || 1), 0);
-          state.prizePool = Math.floor(Math.max(totalCards, 1) * state.stake * 0.8);
+          const totalCards = state.players.reduce((total, joinedPlayer) => total + joinedPlayer.cardIds.length, 0);
+          state.prizePool = totalCards * state.stake;
           localRooms.set(roomId, state);
         }
         const userRes = cartelaReservations[stake] || {};
+        for (const [cardId, reservation] of Object.entries(userRes)) {
+          if (reservation.playerId === playerIdentifier) delete userRes[Number(cardId)];
+        }
         cardIds.forEach((id) => {
-          userRes[id] = playerIdentifier;
+          userRes[id] = {
+            playerId: playerIdentifier,
+            name: player.first_name || player.username || "Player"
+          };
         });
         cartelaReservations[stake] = userRes;
         broadcastCartelaReservations(stake);
@@ -1836,30 +2208,11 @@ function attachBingoRooms(io, botToken) {
         return typeof ack === "function" && ack({ ok: false, error: "No active room found for this player" });
       }
       if (state.status !== "in_progress") {
-        if (state.status === "finished" && state.winnerId === String(player.id)) {
-          const publicState = publicRoomState(state, getOnlinePlayerIds(io, foundRoomId));
-          return typeof ack === "function" && ack({
-            ok: true,
-            state: publicState,
-            balance: state.prize || 0,
-            win: { hasWon: true, patternName: "Bingo Win", winningCoordinates: [], multiplier: 1.8 }
-          });
-        }
         return typeof ack === "function" && ack({ ok: false, error: "Game is not currently active" });
       }
-      let roomPlayer = state.players.find((p) => String(p.telegramId) === String(player.id));
-      if (!roomPlayer) {
-        roomPlayer = {
-          telegramId: String(player.id),
-          name: player.first_name || player.username || "Player",
-          cardIds: [cardId],
-          walletType: "main_wallet",
-          stake: state.stake,
-          joinRequestId: crypto.randomUUID()
-        };
-        state.players.push(roomPlayer);
-      } else if (!roomPlayer.cardIds.includes(cardId)) {
-        roomPlayer.cardIds.push(cardId);
+      const roomPlayer = state.players.find((p) => String(p.telegramId) === String(player.id));
+      if (!roomPlayer || !roomPlayer.cardIds.includes(cardId)) {
+        return typeof ack === "function" && ack({ ok: false, error: "A purchased cartela is required to claim Bingo" });
       }
       const card = generateCartelaByNumber(cardId);
       const calledSet = new Set(state.called);
@@ -1877,8 +2230,8 @@ function attachBingoRooms(io, botToken) {
       state.status = "finished";
       state.winnerId = String(player.id);
       state.winningCardId = cardId;
-      const totalCards = state.players.reduce((total, p) => total + (p.cardIds?.length || 1), 0);
-      const prize = Math.floor(Math.max(totalCards, 1) * state.stake * 0.8);
+      const totalCards = state.players.reduce((total, joinedPlayer) => total + joinedPlayer.cardIds.length, 0);
+      const prize = Math.floor(totalCards * state.stake * 0.8);
       state.prize = prize;
       let finalBal = 0;
       let finalMain = 0;
@@ -1886,46 +2239,50 @@ function attachBingoRooms(io, botToken) {
       try {
         if (await isPostgresConfigured()) {
           const pgResult = await awardPostgresBingoPrize(foundRoomId, String(player.id), cardId, prize);
-          if (!pgResult) return ack({ ok: false, error: "Could not award prize" });
+          if (!pgResult) {
+            state.status = "in_progress";
+            state.winnerId = void 0;
+            state.winningCardId = void 0;
+            state.prize = void 0;
+            localRooms.set(foundRoomId, state);
+            return ack({ ok: false, error: "Could not verify or award the prize" });
+          }
           finalBal = pgResult.balance;
           finalMain = pgResult.mainWallet;
           finalPlay = pgResult.playWallet;
           state = pgResult.state;
         } else {
-          let localUser = localDb.data.users[String(player.id)];
+          let localUser = localDb.getUser(String(player.id));
           if (!localUser) {
             localUser = localDb.upsertUser({
               telegram_id: String(player.id),
               first_name: player.first_name || player.username || "Player",
               username: player.username || `player_${player.id}`,
-              balance: 500,
-              main_wallet: 500,
+              balance: 0,
+              main_wallet: 0,
               play_wallet: 0
             });
           }
-          const mainWallet = (localUser.main_wallet ?? localUser.balance ?? 0) + prize;
-          const playWallet = localUser.play_wallet ?? 0;
-          localUser.balance = mainWallet;
-          localUser.main_wallet = mainWallet;
-          localUser.games_won = (localUser.games_won || 0) + 1;
-          localDb.scheduleSave();
+          const mainWallet = Number(localUser.main_wallet ?? localUser.balance ?? 0) + prize;
+          const playWallet = Number(localUser.play_wallet ?? 0);
+          localDb.upsertUser({
+            ...localUser,
+            balance: mainWallet,
+            main_wallet: mainWallet,
+            games_won: (localUser.games_won || 0) + 1
+          });
           finalBal = mainWallet;
           finalMain = mainWallet;
           finalPlay = playWallet;
         }
         localRooms.set(foundRoomId, state);
-        if (await isPostgresConfigured()) {
-          await mutatePostgresBingoRoom(foundRoomId, () => state);
-        }
-        const activeTimer = activeTimers.get(foundRoomId);
-        if (activeTimer) {
-          clearTimeout(activeTimer);
-          activeTimers.delete(foundRoomId);
+        const drawTimer = activeDrawTimers.get(foundRoomId);
+        if (drawTimer) {
+          clearInterval(drawTimer);
+          activeDrawTimers.delete(foundRoomId);
         }
         cartelaReservations[state.stake] = {};
         broadcastCartelaReservations(state.stake);
-        const publicState = publicRoomState(state, getOnlinePlayerIds(io, foundRoomId));
-        io.to(foundRoomId).emit("room:state", publicState);
         io.to(foundRoomId).emit("room:winner", {
           gameId: state.gameId,
           winnerId: String(player.id),
@@ -1937,6 +2294,8 @@ function attachBingoRooms(io, botToken) {
           playWallet: finalPlay,
           win: winResult
         });
+        const publicState = publicRoomState(state, getOnlinePlayerIds(io, foundRoomId));
+        io.to(foundRoomId).emit("room:state", publicState);
         scheduleRoomReset(foundRoomId);
         socket.emit("wallet:balance", {
           balance: finalBal,
@@ -1957,15 +2316,31 @@ function attachBingoRooms(io, botToken) {
     });
     client.on("room:leave", (payload) => {
       const stake = Number(payload.stake);
-      const roomId = roomIdForStake(stake);
-      void client.leave(roomId);
+      if (!VALID_STAKES.has(stake)) return;
+      const userRes = cartelaReservations[stake] || {};
+      for (const [cardId, reservation] of Object.entries(userRes)) {
+        if (reservation.playerId === playerIdentifier) delete userRes[Number(cardId)];
+      }
+      cartelaReservations[stake] = userRes;
+      broadcastCartelaReservations(stake);
     });
     client.on("disconnect", () => {
-      localRooms.forEach((state, rId) => {
-        if (state.players.some((p) => String(p.telegramId) === String(player.id))) {
-          sendRoomState(io, rId, state);
-        }
-      });
+      const userRes = cartelaReservations[10] || {};
+      for (const [cardId, reservation] of Object.entries(userRes)) {
+        if (reservation.playerId === playerIdentifier) delete userRes[Number(cardId)];
+      }
+      cartelaReservations[10] = userRes;
+      broadcastCartelaReservations(10);
+      const state = localRooms.get(GLOBAL_ROOM_ID);
+      if (state) sendRoomState(io, GLOBAL_ROOM_ID, state);
+    });
+    void Promise.all([roomMembership, ensureGlobalRoom()]).then(([, globalState]) => {
+      if (!client.connected) return;
+      sendRoomState(io, GLOBAL_ROOM_ID, globalState);
+      broadcastCartelaReservations(globalState.stake);
+      client.emit("room:ready");
+    }).catch((error) => {
+      console.error("Could not initialize the global bingo connection:", error);
     });
   });
 }
@@ -1980,7 +2355,9 @@ function isStaticFrontendUrl(url) {
 if (typeof globalThis.WebSocket === "undefined") {
   globalThis.WebSocket = WebSocket;
 }
-var supabaseUrl = (process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || "").trim();
+var PRODUCTION_SUPABASE_URL = "https://sqmicjzafgcymcfdjlai.supabase.co";
+var isProduction = process.env.NODE_ENV === "production";
+var supabaseUrl = (isProduction ? PRODUCTION_SUPABASE_URL : process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || PRODUCTION_SUPABASE_URL).trim();
 if (!supabaseUrl) {
   for (const [k, v] of Object.entries(process.env)) {
     if (typeof v !== "string" || !v.trim()) continue;
@@ -2016,7 +2393,7 @@ var supabaseInitError = "";
 var supabase = null;
 function getSupabase() {
   if (supabase) return supabase;
-  const savedSupa = localDb.getSupabaseConfig();
+  const savedSupa = isProduction ? { url: "", key: "" } : localDb.getSupabaseConfig();
   let cleanUrl = (savedSupa.url || supabaseUrl || "").replace(/^['"]|['"]$/g, "").trim();
   let cleanKey = (savedSupa.key || supabaseKey || "").replace(/^['"]|['"]$/g, "").trim();
   if (!cleanUrl) {
@@ -2125,7 +2502,7 @@ async function upsertUserAdaptive(payload) {
         id: numId,
         telegram_id: String(payload.telegram_id),
         username: String(payload.username || ""),
-        balance: payload.balance ?? 10
+        balance: payload.balance ?? 0
       };
       continue;
     }
@@ -2133,7 +2510,7 @@ async function upsertUserAdaptive(payload) {
       currentPayload = {
         telegram_id: String(payload.telegram_id),
         username: String(payload.username || ""),
-        balance: payload.balance ?? 10
+        balance: payload.balance ?? 0
       };
       continue;
     }
@@ -2153,6 +2530,7 @@ var activeBotToken = (process.env.BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN ||
 var activeBotUsername = (process.env.VITE_BOT_USERNAME || savedBotConfig.bot_username || "salerybingo_bot").replace("@", "").trim();
 var isLongPollingRunning = false;
 var currentPollingInstanceId = "";
+var currentPollingToken = "";
 if (!savedBotConfig.bot_token) {
   localDb.saveBotConfig(activeBotToken, activeBotUsername);
 }
@@ -2239,7 +2617,11 @@ function getVerifiedRequestUser(req) {
   const authorization = req.headers.authorization || "";
   if (!authorization.startsWith("tma ")) return null;
   const walletBotToken = process.env.BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN || "";
-  return validateTelegramInitData(authorization.slice(4), walletBotToken);
+  return validateTelegramInitData(
+    authorization.slice(4),
+    walletBotToken,
+    isLoopbackClientAllowed(req.headers.origin, req.socket.remoteAddress)
+  );
 }
 function requireVerifiedAdmin(req, res) {
   const user = getVerifiedRequestUser(req);
@@ -2298,6 +2680,18 @@ var inMemoryBroadcastHistory = [
     created_at: new Date(Date.now() - 36e5 * 48).toISOString()
   }
 ];
+async function persistBroadcastRecord(record) {
+  if (isPostgresConfigured()) {
+    const saved = await savePostgresBroadcast(record);
+    if (!saved) throw new Error("Supabase PostgreSQL did not save the broadcast record");
+  } else if (isProduction) {
+    throw new Error("Cannot persist broadcast history: Supabase PostgreSQL is unavailable");
+  } else {
+    localDb.addBroadcast(record);
+  }
+  inMemoryBroadcastHistory.unshift(record);
+  if (inMemoryBroadcastHistory.length > 200) inMemoryBroadcastHistory.pop();
+}
 var inMemoryMediaGallery = [
   {
     id: "med_bonus",
@@ -2351,7 +2745,7 @@ async function getOrCreateTelegramUser(from, referredBy) {
   const existing = localDb.getUser(telegramId);
   if (existing) {
     const role = isAdminUser(telegramId) ? "admin" : existing.role || "user";
-    const finalBalance = Number(existing.balance !== void 0 ? existing.balance : role === "admin" ? 24560 : 0);
+    const finalBalance = Number(existing.balance ?? 0);
     existing.balance = finalBalance;
     existing.updated_at = (/* @__PURE__ */ new Date()).toISOString();
     localDb.upsertUser({
@@ -2394,7 +2788,7 @@ async function getOrCreateTelegramUser(from, referredBy) {
           first_name: supaUser.first_name || from.first_name || "",
           full_name: supaUser.full_name || fullName,
           phone_number: supaUser.phone_number || "",
-          balance: Number(supaUser.balance !== void 0 ? supaUser.balance : userRole === "admin" ? 24560 : 0),
+          balance: Number(supaUser.balance ?? 0),
           role: userRole === "admin" ? "admin" : supaUser.role || "user",
           status: supaUser.status || "active",
           is_blocked: !!supaUser.is_blocked,
@@ -2425,8 +2819,8 @@ async function getOrCreateTelegramUser(from, referredBy) {
   } catch (err) {
     console.warn("Supabase check user error:", err);
   }
-  const initialMain = userRole === "admin" ? 24560 : 0;
-  const initialPlay = userRole === "admin" ? 0 : 10;
+  const initialMain = 0;
+  const initialPlay = 0;
   const cachedVerified = verifiedUsersCache[telegramId];
   const userEverVerified = isUserEverVerified(telegramId) || !!cachedVerified?.phone;
   const effectivePhone = cachedVerified?.phone || "";
@@ -2576,7 +2970,7 @@ async function getUserBalance(telegramId) {
   if (user && typeof user.balance === "number") {
     return user.balance;
   }
-  return isAdminUser(telegramId) ? 24560 : 0;
+  return 0;
 }
 async function getUserFull(telegramId) {
   const tId = String(telegramId);
@@ -2613,7 +3007,7 @@ async function getUserFull(telegramId) {
           full_name: supaUser.full_name || supaUser.first_name || "Player",
           username: supaUser.username || "",
           phone_number: supaUser.phone_number || "",
-          balance: Number(supaUser.balance ?? (isAdminUser(tId) ? 24560 : 0)),
+          balance: Number(supaUser.balance ?? 0),
           role: supaUser.role || (isAdminUser(tId) ? "admin" : "user"),
           status: supaUser.status || (supaUser.is_blocked ? "blocked" : "active"),
           is_blocked: !!supaUser.is_blocked || supaUser.status === "blocked",
@@ -2633,7 +3027,7 @@ async function getUserFull(telegramId) {
   if (user) {
     const code = user.player_code || generatePlayerCode(tId);
     const role = isAdminUser(tId) ? "admin" : user.role || "user";
-    const balance = Number(user.balance ?? (role === "admin" ? 24560 : 0));
+    const balance = Number(user.balance ?? 0);
     return {
       ...user,
       player_code: code,
@@ -3126,14 +3520,14 @@ async function processTelegramUpdate(update, botToken) {
             first_name: fromUser.first_name || "Player",
             full_name: (fromUser.first_name || "Player") + (fromUser.last_name ? " " + fromUser.last_name : ""),
             username: fromUser.username || "",
-            balance: 10,
+            balance: 0,
             role: "user",
             status: "active"
           });
           fullUser = {
             ...registered,
             role: "user",
-            balance: 10,
+            balance: 0,
             player_code: registered.player_code
           };
           try {
@@ -3357,7 +3751,7 @@ ${pendingDepText}` : "") + `
         ]);
         keyboardButtons.push([
           { text: `\u{1F504} Refresh Stats (${totalUsers} Users)`, callback_data: "adm_refresh" },
-          { text: "\u{1F3AE} Play Game", web_app: { url: buildWebAppUrl(webAppUrl, fromUser.id, 24560) } }
+          { text: "\u{1F3AE} Play Game", web_app: { url: buildWebAppUrl(webAppUrl, fromUser.id, 0) } }
         ]);
         const adminKeyboard = { inline_keyboard: keyboardButtons };
         await sendTelegramMessage(botToken, chatId, adminMsg, adminKeyboard);
@@ -3400,7 +3794,7 @@ ${pendingDepText}` : "") + `
         localDb.upsertUser({
           telegram_id: targetId,
           role: "admin",
-          balance: 24560,
+          balance: 0,
           status: "active",
           is_verified: true
         });
@@ -3501,7 +3895,7 @@ ${pendingDepText}` : "") + `
         const userResult = await getOrCreateTelegramUser(fromUser, referredBy);
         const isAdmin = isAdminUser(fromUser.id);
         const userRecord = localDb.getUser(fromUser.id);
-        const currentBalance = userResult.balance !== void 0 ? userResult.balance : userRecord?.balance ?? (isAdmin ? 24560 : 0);
+        const currentBalance = userResult.balance ?? userRecord?.balance ?? 0;
         const playerCode = userResult.playerCode || userRecord?.player_code || generatePlayerCode(fromUser.id);
         const userPhone = userResult.phoneNumber || userRecord?.phone_number || verifiedUsersCache[String(fromUser.id)]?.phone || "";
         const isVerified = isUserEverVerified(fromUser.id) || !!(userPhone && String(userPhone).trim()) || !!userRecord?.is_verified;
@@ -3868,7 +4262,7 @@ ${pendingDepText}` : "") + `
         }
         if (cleanText === "play \u{1F3AE}" || cleanText === "play" || cleanText === "/play") {
           const fullUser = await getUserFull(fromUser.id);
-          const currentBal = fullUser?.balance || 10;
+          const currentBal = fullUser?.balance ?? 0;
           await sendTelegramMessage(
             botToken,
             chatId,
@@ -3884,7 +4278,7 @@ ${pendingDepText}` : "") + `
           const playerCode = existingBefore?.player_code || generatePlayerCode(fromUser.id);
           const playerName = fromUser.first_name || existingBefore?.first_name || "Player";
           const fullName = [fromUser.first_name, fromUser.last_name].filter(Boolean).join(" ") || playerName;
-          const currentBal = existingBefore?.balance ?? 10;
+          const currentBal = existingBefore?.balance ?? 0;
           localDb.upsertUser({
             telegram_id: String(fromUser.id),
             player_code: playerCode,
@@ -4068,21 +4462,36 @@ ${pendingDepText}` : "") + `
 function stopLongPolling(reason = "restart") {
   currentPollingInstanceId = `stopped_${Date.now()}`;
   isLongPollingRunning = false;
+  currentPollingToken = "";
   console.log(`\u{1F6D1} Stopping Telegram long polling (${reason})`);
 }
+function isTelegramBotEnabled() {
+  if (process.env.DISABLE_TELEGRAM_BOT?.trim().toLowerCase() === "true") return false;
+  return process.env.NODE_ENV === "production";
+}
 function isTelegramPollingEnabled() {
-  if (process.env.ENABLE_TELEGRAM_POLLING === "false") return false;
+  if (!isTelegramBotEnabled()) return false;
+  if (process.env.ENABLE_TELEGRAM_POLLING?.trim().toLowerCase() === "false") return false;
   if (process.env.TELEGRAM_WEBHOOK_URL && process.env.TELEGRAM_WEBHOOK_URL.trim().startsWith("http")) return false;
   return true;
 }
 async function startLongPolling(botToken) {
+  if (!isTelegramPollingEnabled()) {
+    console.info("Telegram polling disabled by local or environment configuration.");
+    return;
+  }
   if (!botToken || !botToken.includes(":") || botToken.length < 15) {
     console.warn("Cannot start Telegram long polling: invalid or missing token.");
+    return;
+  }
+  if (isLongPollingRunning && currentPollingToken === botToken) {
+    console.info("Telegram long polling is already active for this process.");
     return;
   }
   stopLongPolling("before-new-instance");
   const instanceId = `${Date.now()}_${Math.floor(Math.random() * 1e5)}`;
   currentPollingInstanceId = instanceId;
+  currentPollingToken = botToken;
   isLongPollingRunning = true;
   console.log(`\u{1F680} Starting Telegram Long Polling (Instance: ${instanceId})...`);
   try {
@@ -4116,14 +4525,8 @@ async function startLongPolling(botToken) {
       } else if (!data.ok) {
         if (data.error_code === 409) {
           consecutiveConflicts++;
-          console.warn(
-            `\u26A0\uFE0F Telegram 409 Conflict (Attempt ${consecutiveConflicts}): Another instance or webhook is active.`
-          );
-          try {
-            await fetch(
-              `https://api.telegram.org/bot${botToken}/deleteWebhook?drop_pending_updates=true`
-            );
-          } catch (e) {
+          if (consecutiveConflicts === 1) {
+            console.warn("Telegram polling conflict: another poller is using this token; retrying with backoff.");
           }
           const delay = Math.min(3e4, 5e3 * consecutiveConflicts);
           await new Promise((r) => setTimeout(r, delay));
@@ -4148,12 +4551,14 @@ async function startLongPolling(botToken) {
   }
   if (currentPollingInstanceId === instanceId) {
     isLongPollingRunning = false;
+    currentPollingToken = "";
   }
 }
 async function startServer() {
   const app = express();
   const httpServer = createServer(app);
   const PORT = Number(process.env.PORT) || 8080;
+  const HOST = isProduction ? "0.0.0.0" : process.env.HOST || "0.0.0.0";
   const socketServer = new SocketServer(httpServer, {
     cors: {
       origin: (_origin, callback) => callback(null, true),
@@ -4162,7 +4567,7 @@ async function startServer() {
     },
     transports: ["websocket", "polling"]
   });
-  attachBingoRooms(socketServer, process.env.BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN || "");
+  attachBingoRooms(socketServer);
   app.use(
     cors({
       origin: (_origin, callback) => callback(null, true),
@@ -4226,9 +4631,110 @@ async function startServer() {
       dbStatus: localDb.getStatus()
     });
   });
+  app.post("/api/bingo/guest-session", async (req, res) => {
+    try {
+      if (!signBingoGuestToken(0)) {
+        return res.status(503).json({ ok: false, error: "BINGO_GUEST_SECRET must be configured with at least 32 characters" });
+      }
+      const existingPlayerId = Number(req.body?.playerId);
+      const existingToken = req.body?.token;
+      const isLocalTestRequest = isLoopbackClientAllowed(req.headers.origin, req.socket.remoteAddress);
+      if (Number.isSafeInteger(existingPlayerId) && existingPlayerId > 0 && isValidBingoGuestToken(existingPlayerId, existingToken)) {
+        let existingAccount = isPostgresConfigured() ? await getPostgresUser(String(existingPlayerId)) : localDb.getUser(String(existingPlayerId));
+        if (existingAccount) {
+          let mainWallet2 = Number(existingAccount.main_wallet ?? existingAccount.balance ?? 0);
+          let balance = Number(existingAccount.balance ?? mainWallet2);
+          if (isLocalTestRequest) {
+            mainWallet2 = minimumLocalTestBalance(mainWallet2, balance);
+            balance = mainWallet2;
+            if (isPostgresConfigured()) {
+              const updatedBalance = await setPostgresUserBalance(String(existingPlayerId), mainWallet2);
+              if (updatedBalance === null) throw new Error("Could not update the local test wallet balance");
+              existingAccount = { ...existingAccount, balance: updatedBalance, main_wallet: updatedBalance };
+              mainWallet2 = updatedBalance;
+              balance = updatedBalance;
+            } else {
+              existingAccount = localDb.upsertUser({
+                ...existingAccount,
+                telegram_id: String(existingPlayerId),
+                balance: mainWallet2,
+                main_wallet: mainWallet2
+              });
+            }
+          }
+          const playWallet2 = Number(existingAccount.play_wallet ?? 0);
+          return res.json({
+            ok: true,
+            playerId: existingPlayerId,
+            token: existingToken,
+            balance,
+            mainWallet: mainWallet2,
+            playWallet: playWallet2,
+            playerCode: existingAccount.player_code
+          });
+        }
+      }
+      let playerId = 0;
+      let account = null;
+      const localTestBalance = isLocalTestRequest ? minimumLocalTestBalance() : 0;
+      for (let attempt = 0; attempt < 5 && !account; attempt++) {
+        playerId = randomInt(1e15, 125e13);
+        const id = String(playerId);
+        if (localDb.getUser(id)) continue;
+        if (isPostgresConfigured() && await getPostgresUser(id)) continue;
+        const newUser = {
+          telegram_id: id,
+          player_code: generatePlayerCode(id),
+          first_name: "Player",
+          full_name: "Player",
+          username: `player_${id.slice(-4)}`,
+          balance: localTestBalance,
+          main_wallet: localTestBalance,
+          play_wallet: 0,
+          role: "user",
+          status: "active",
+          is_blocked: false,
+          is_verified: false
+        };
+        account = isPostgresConfigured() ? await upsertPostgresUser(newUser) : localDb.upsertUser(newUser);
+        if (account && isPostgresConfigured()) {
+          localDb.upsertUser({
+            ...newUser,
+            balance: Number(account.balance ?? 0),
+            main_wallet: Number(account.main_wallet ?? account.balance ?? 0),
+            play_wallet: Number(account.play_wallet ?? 0)
+          });
+        }
+      }
+      if (!account) {
+        return res.status(503).json({ ok: false, error: "Could not create a unique guest player account" });
+      }
+      const token = signBingoGuestToken(playerId);
+      if (!token) {
+        return res.status(503).json({ ok: false, error: "BINGO_GUEST_SECRET must be configured with at least 32 characters" });
+      }
+      const mainWallet = Number(account.main_wallet ?? account.balance ?? 0);
+      const playWallet = Number(account.play_wallet ?? 0);
+      return res.json({
+        ok: true,
+        playerId,
+        token,
+        balance: Number(account.balance ?? mainWallet),
+        mainWallet,
+        playWallet,
+        playerCode: account.player_code
+      });
+    } catch (error) {
+      console.error("Could not issue bingo guest session:", error);
+      return res.status(500).json({ ok: false, error: "Could not issue bingo guest session" });
+    }
+  });
+  app.post("/api/user/:telegramId/share-bonus", async (req, res) => {
+    return res.status(410).json({ ok: false, error: "Share bonuses are no longer credited to player wallets" });
+  });
   app.post("/api/user/sync", async (req, res) => {
     try {
-      const { telegramId, firstName, username, phoneNumber, referredBy } = req.body;
+      const { telegramId, referredBy } = req.body;
       if (!telegramId) return res.status(400).json({ ok: false, error: "telegramId is required" });
       if (!requireVerifiedPlayer(req, res, String(telegramId))) return;
       const tId = String(telegramId);
@@ -4236,10 +4742,23 @@ async function startServer() {
       const telegramUser = getVerifiedRequestUser(req);
       const userRole = isAdm ? "admin" : "user";
       const code = generatePlayerCode(tId);
+      const telegramFirstName = telegramUser.first_name || "Player";
+      const telegramFullName = [telegramUser.first_name, telegramUser.last_name].filter(Boolean).join(" ") || "Player";
       const postgresExisting = await getPostgresUser(tId).catch((err) => {
         console.warn("PostgreSQL user lookup failed during sync:", err);
         return null;
       });
+      const client = getSupabase();
+      let supabaseExisting = null;
+      if (!postgresExisting && client) {
+        try {
+          const { data, error } = await client.from("users").select("*").eq("telegram_id", tId).maybeSingle();
+          if (error) console.warn("Supabase user lookup failed during Telegram registration:", error.message);
+          else supabaseExisting = data;
+        } catch (error) {
+          console.warn("Supabase user lookup threw during Telegram registration:", error);
+        }
+      }
       let existing = postgresExisting ? localDb.upsertUser({
         telegram_id: tId,
         player_code: postgresExisting.player_code,
@@ -4247,28 +4766,47 @@ async function startServer() {
         full_name: postgresExisting.full_name,
         username: postgresExisting.username,
         phone_number: postgresExisting.phone_number,
-        balance: Number(postgresExisting.balance ?? 0),
+        balance: Number(postgresExisting.main_wallet ?? postgresExisting.balance ?? 0),
+        main_wallet: Number(postgresExisting.main_wallet ?? postgresExisting.balance ?? 0),
+        play_wallet: Number(postgresExisting.play_wallet ?? 0),
         role: postgresExisting.role || userRole,
         status: postgresExisting.status,
         is_blocked: !!postgresExisting.is_blocked,
         is_verified: !!postgresExisting.is_verified,
         referred_by: postgresExisting.referred_by
+      }) : supabaseExisting ? localDb.upsertUser({
+        telegram_id: tId,
+        player_code: supabaseExisting.player_code,
+        first_name: supabaseExisting.first_name,
+        full_name: supabaseExisting.full_name,
+        username: supabaseExisting.username,
+        phone_number: supabaseExisting.phone_number,
+        balance: Number(supabaseExisting.main_wallet ?? supabaseExisting.balance ?? 0),
+        main_wallet: Number(supabaseExisting.main_wallet ?? supabaseExisting.balance ?? 0),
+        play_wallet: Number(supabaseExisting.play_wallet ?? 0),
+        role: supabaseExisting.role || userRole,
+        status: supabaseExisting.status,
+        is_blocked: !!supabaseExisting.is_blocked,
+        is_verified: !!supabaseExisting.is_verified,
+        referred_by: supabaseExisting.referred_by
       }) : localDb.getUser(tId);
-      let finalBalance = existing ? existing.balance : isAdm ? 24560 : 0;
+      let finalBalance = existing ? existing.balance : 0;
       const updatedUser = localDb.upsertUser({
         telegram_id: tId,
         player_code: code,
-        first_name: telegramUser.first_name || firstName || (existing ? existing.first_name : "Player"),
-        full_name: telegramUser.first_name || firstName || (existing ? existing.full_name : "Player"),
-        username: telegramUser.username || username || (existing ? existing.username : ""),
-        phone_number: phoneNumber || (existing ? existing.phone_number : ""),
+        first_name: telegramFirstName,
+        full_name: telegramFullName,
+        username: telegramUser.username || existing?.username || "",
+        phone_number: existing?.phone_number || "",
         balance: finalBalance,
         role: userRole,
         status: existing?.status || "active",
         is_blocked: !!existing?.is_blocked,
-        is_verified: !!phoneNumber || !!existing?.is_verified,
+        is_verified: !!existing?.is_verified,
         referred_by: referredBy || existing?.referred_by
       });
+      const mainWallet = Number(updatedUser.main_wallet ?? finalBalance);
+      const playWallet = Number(updatedUser.play_wallet ?? 0);
       const postgresUser = await upsertPostgresUser({
         telegram_id: tId,
         player_code: code,
@@ -4277,6 +4815,8 @@ async function startServer() {
         username: updatedUser.username,
         phone_number: updatedUser.phone_number,
         balance: finalBalance,
+        main_wallet: mainWallet,
+        play_wallet: playWallet,
         role: userRole,
         status: updatedUser.status,
         is_blocked: updatedUser.is_blocked,
@@ -4286,7 +4826,6 @@ async function startServer() {
         console.warn("PostgreSQL user upsert failed:", err);
         return null;
       });
-      const client = getSupabase();
       let supaSynced = false;
       if (client) {
         try {
@@ -4298,6 +4837,8 @@ async function startServer() {
             username: updatedUser.username,
             phone_number: updatedUser.phone_number,
             balance: finalBalance,
+            main_wallet: mainWallet,
+            play_wallet: playWallet,
             role: userRole,
             status: updatedUser.status,
             is_blocked: updatedUser.is_blocked,
@@ -4328,6 +4869,7 @@ async function startServer() {
   app.get("/api/user/:telegramId", async (req, res) => {
     const telegramId = String(req.params.telegramId);
     if (!requireVerifiedPlayer(req, res, telegramId)) return;
+    const isLocalTestRequest = isLoopbackClientAllowed(req.headers.origin, req.socket.remoteAddress);
     const postgresUser = await getPostgresUser(telegramId).catch((err) => {
       console.warn("PostgreSQL profile lookup failed:", err);
       return null;
@@ -4345,7 +4887,7 @@ async function startServer() {
             full_name: supaUser.full_name || supaUser.first_name || "Player",
             username: supaUser.username || "",
             phone_number: supaUser.phone_number || "",
-            balance: Number(supaUser.balance ?? (isAdminUser(telegramId) ? 24560 : 0)),
+            balance: Number(supaUser.balance ?? 0),
             role: supaUser.role || (isAdminUser(telegramId) ? "admin" : "user"),
             status: supaUser.status || (supaUser.is_blocked ? "blocked" : "active"),
             is_blocked: !!supaUser.is_blocked || supaUser.status === "blocked",
@@ -4358,8 +4900,8 @@ async function startServer() {
     }
     if (!fullUser) {
       const devRole = isAdminUser(telegramId) ? "admin" : "user";
-      const devBalance = isAdminUser(telegramId) ? 24560 : 0;
-      const devPlay = isAdminUser(telegramId) ? 0 : 10;
+      const devBalance = 0;
+      const devPlay = 0;
       fullUser = localDb.upsertUser({
         telegram_id: telegramId,
         balance: devBalance,
@@ -4377,7 +4919,19 @@ async function startServer() {
         });
       }
     }
-    const mainWallet = Number(postgresUser?.main_wallet ?? fullUser?.main_wallet ?? fullUser.balance);
+    let mainWallet = Number(postgresUser?.main_wallet ?? fullUser?.main_wallet ?? fullUser.balance);
+    if (isLocalTestRequest && mainWallet < minimumLocalTestBalance()) {
+      mainWallet = minimumLocalTestBalance(mainWallet, fullUser.balance);
+      if (postgresUser) {
+        const updatedBalance = await setPostgresUserBalance(telegramId, mainWallet);
+        if (updatedBalance === null) {
+          return res.status(503).json({ ok: false, error: "Could not update the local test wallet balance" });
+        }
+        mainWallet = updatedBalance;
+      }
+      localDb.updateUserBalance(telegramId, mainWallet);
+      fullUser = { ...fullUser, balance: mainWallet, main_wallet: mainWallet };
+    }
     const playWallet = Number(postgresUser?.play_wallet ?? fullUser?.play_wallet ?? 0);
     const balance = mainWallet;
     const isAdmin = isAdminUser(telegramId);
@@ -4402,6 +4956,7 @@ async function startServer() {
     });
   });
   app.get("/api/admin/users", async (req, res) => {
+    if (!requireVerifiedAdmin(req, res)) return;
     try {
       const client = getSupabase();
       const postgresUsers = await getPostgresUsers().catch((err) => {
@@ -4418,7 +4973,7 @@ async function startServer() {
             full_name: user.full_name || user.first_name || "Player",
             username: user.username || "",
             phone_number: user.phone_number || "",
-            balance: Number(user.balance ?? 10),
+            balance: Number(user.balance ?? 0),
             role: user.role || (String(user.telegram_id) === "908336796" ? "admin" : "user"),
             status: user.status || (user.is_blocked ? "blocked" : "active"),
             is_blocked: !!user.is_blocked || user.status === "blocked",
@@ -4441,7 +4996,7 @@ async function startServer() {
                   full_name: su.full_name || su.first_name || "Player",
                   username: su.username || "",
                   phone_number: su.phone_number || "",
-                  balance: Number(su.balance ?? (String(su.telegram_id) === "908336796" ? 24560 : 0)),
+                  balance: Number(su.balance ?? 0),
                   role: su.role || (String(su.telegram_id) === "908336796" ? "admin" : "user"),
                   status: su.status || (su.is_blocked ? "blocked" : "active"),
                   is_blocked: !!su.is_blocked || su.status === "blocked",
@@ -4462,7 +5017,7 @@ async function startServer() {
         const role = isAdmin ? "admin" : u.role || "user";
         const isBlocked = u.status === "blocked" || u.is_blocked === true;
         const banReason = u.ban_reason;
-        const balance = Number(u.balance ?? (role === "admin" ? 24560 : 0));
+        const balance = Number(u.balance ?? 0);
         return {
           id: u.id,
           telegram_id: tId,
@@ -4637,6 +5192,7 @@ ${reason ? `\u{1F4DD} \u121D\u12AD\u1295\u12EB\u1275\u1366 ${reason}
     });
   });
   app.post("/api/admin/broadcast", async (req, res) => {
+    if (!requireVerifiedAdmin(req, res)) return;
     const { message, targetTelegramId, photoUrl, photoTitle, botToken: bodyToken } = req.body;
     const botToken = bodyToken || getActiveBotToken(req);
     if (!message && !photoUrl) {
@@ -4691,7 +5247,7 @@ ${reason ? `\u{1F4DD} \u121D\u12AD\u1295\u12EB\u1275\u1366 ${reason}
           sent_count: 1,
           created_at: (/* @__PURE__ */ new Date()).toISOString()
         };
-        localDb.addBroadcast(record2);
+        await persistBroadcastRecord(record2);
         return res.json({
           ok: true,
           sentCount: 1,
@@ -4792,7 +5348,12 @@ ${reason ? `\u{1F4DD} \u121D\u12AD\u1295\u12EB\u1275\u1366 ${reason}
         sent_count: deliveredCount || totalTargetCount,
         created_at: (/* @__PURE__ */ new Date()).toISOString()
       };
-      localDb.addBroadcast(record);
+      await persistBroadcastRecord(record);
+      socketServer.emit("admin:broadcast", {
+        message: finalCaptionOrText,
+        photoUrl: photoUrl || void 0,
+        createdAt: record.created_at
+      });
       return res.json({
         ok: true,
         sentCount: deliveredCount || totalTargetCount,
@@ -4823,6 +5384,9 @@ ${reason ? `\u{1F4DD} \u121D\u12AD\u1295\u12EB\u1275\u1366 ${reason}
     });
   });
   app.post("/api/admin/bot-config", async (req, res) => {
+    if (!isTelegramBotEnabled()) {
+      return res.status(503).json({ ok: false, error: "Telegram bot integration is disabled in local development" });
+    }
     const { botToken, botUsername, webAppUrl } = req.body;
     const cleanToken = String(botToken || activeBotToken || "").trim();
     if (!cleanToken && !webAppUrl) {
@@ -4871,8 +5435,16 @@ ${reason ? `\u{1F4DD} \u121D\u12AD\u1295\u12EB\u1275\u1366 ${reason}
       return res.status(500).json({ ok: false, error: err.message || "\u130D\u1295\u1299\u1290\u1275 \u12A0\u120D\u1270\u1233\u12AB\u121D" });
     }
   });
-  app.get("/api/admin/broadcast/history", (req, res) => {
-    res.json({ ok: true, history: inMemoryBroadcastHistory });
+  app.get("/api/admin/broadcast/history", async (_req, res) => {
+    try {
+      const persistedHistory = await getPostgresBroadcasts();
+      if (persistedHistory) return res.json({ ok: true, history: persistedHistory });
+      if (isProduction) return res.status(503).json({ ok: false, error: "Broadcast history database is unavailable" });
+      return res.json({ ok: true, history: inMemoryBroadcastHistory });
+    } catch (error) {
+      console.error("Could not load persisted broadcast history:", error);
+      return res.status(503).json({ ok: false, error: "Broadcast history database is unavailable" });
+    }
   });
   app.get("/api/admin/media", (req, res) => {
     const combined = [...inMemoryMediaGallery];
@@ -5345,6 +5917,9 @@ ${reason ? `\u{1F4DD} \u121D\u12AD\u1295\u12EB\u1275\u1366 ${reason}
     });
   });
   const webhookHandler = async (req, res) => {
+    if (!isTelegramBotEnabled()) {
+      return res.status(404).send("Telegram bot integration is disabled in local development");
+    }
     if (req.method === "GET") {
       return res.json({
         status: "ok",
@@ -5403,27 +5978,30 @@ ${reason ? `\u{1F4DD} \u121D\u12AD\u1295\u12EB\u1275\u1366 ${reason}
       });
     }
   }
-  httpServer.listen(Number(PORT), "0.0.0.0", () => {
-    console.log(`Salery Bingo Backend running on port ${PORT}`);
-    if (isPostgresConfigured()) {
-      initializePostgres().then(() => console.info("PostgreSQL users, deposits, and withdrawals tables are ready.")).catch((err) => console.warn("PostgreSQL startup initialization failed, falling back to local database:", err?.message || err));
+  if (isProduction) {
+    const postgresUrl = (process.env.SUPABASE_DB_URL || process.env.DATABASE_URL || process.env.POSTGRES_URL || process.env.POSTGRES_PRISMA_URL || "").trim();
+    const serviceKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_SECRET_KEY || "").trim();
+    if (!isPostgresConfigured() || !postgresUrl.toLowerCase().includes("sqmicjzafgcymcfdjlai")) {
+      throw new Error("Production requires a Supabase PostgreSQL connection string for project sqmicjzafgcymcfdjlai in SUPABASE_DB_URL.");
+    }
+    if (!serviceKey || !getSupabase()) {
+      throw new Error("Production requires a valid SUPABASE_SERVICE_ROLE_KEY and SUPABASE_URL.");
+    }
+    await initializePostgres();
+    console.info("Supabase PostgreSQL users, game state, and broadcast history tables are ready.");
+  }
+  httpServer.listen(Number(PORT), HOST, () => {
+    console.log(`Salery Bingo Backend listening on http://${HOST}:${PORT}`);
+    if (!isProduction && isPostgresConfigured()) {
+      initializePostgres().then(() => console.info("PostgreSQL tables are ready.")).catch((err) => console.warn("PostgreSQL startup initialization failed:", err?.message || err));
     }
     try {
       const client = getSupabase();
-      if (client) {
+      if (client && !isProduction) {
         console.log("\u{1F504} Server started with active Supabase connection. Running background sync for local database users...");
         const allLocalUsers = localDb.getAllUsers();
         const allLocalTxs = localDb.getTransactions();
         void (async () => {
-          try {
-            console.log("\u{1F9F9} Remote Supabase Cleanup: Wiping out old mock records...");
-            await client.from("users").delete().neq("telegram_id", "908336796");
-            await client.from("transactions").delete().neq("id", "keep_safe_none_existent_id");
-            await client.from("game_logs").delete().neq("id", "keep_safe_none_existent_id");
-            console.log("\u2705 Remote Supabase database wiped clean of old test records!");
-          } catch (e) {
-            console.warn("Startup database wipe failed:", e);
-          }
           let syncedUsers = 0;
           for (const u of allLocalUsers) {
             try {
@@ -5462,7 +6040,9 @@ ${reason ? `\u{1F4DD} \u121D\u12AD\u1295\u12EB\u1275\u1366 ${reason}
       console.warn("Startup background Supabase sync failed:", err);
     }
     const botToken = getActiveBotToken();
-    if (botToken) {
+    if (!isTelegramBotEnabled()) {
+      console.info("Telegram bot initialization, webhooks, and polling disabled for local development.");
+    } else if (botToken) {
       const webAppUrl = resolveWebAppUrl();
       fetch(`https://api.telegram.org/bot${botToken}/setChatMenuButton`, {
         method: "POST",
@@ -5485,12 +6065,13 @@ ${reason ? `\u{1F4DD} \u121D\u12AD\u1295\u12EB\u1275\u1366 ${reason}
         }).catch((err) => {
           console.error("Failed to configure Telegram webhook:", err);
         });
-      } else {
-        isLongPollingRunning = true;
+      } else if (isTelegramPollingEnabled()) {
         startLongPolling(botToken).catch((err) => {
           isLongPollingRunning = false;
           console.error("Long polling error:", err);
         });
+      } else {
+        console.info("\u{1F6D1} Telegram bot polling disabled in local mode; app is running without bot startup.");
       }
     } else if (!botToken) {
       console.info("BOT_TOKEN is not set; configure Telegram from the Admin Panel when needed.");
@@ -5499,6 +6080,7 @@ ${reason ? `\u{1F4DD} \u121D\u12AD\u1295\u12EB\u1275\u1366 ${reason}
 }
 startServer().catch((err) => {
   console.error("FATAL startServer exception:", err);
+  process.exitCode = 1;
 });
 export {
   generatePlayerCode,

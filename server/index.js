@@ -2355,9 +2355,8 @@ function isStaticFrontendUrl(url) {
 if (typeof globalThis.WebSocket === "undefined") {
   globalThis.WebSocket = WebSocket;
 }
-var PRODUCTION_SUPABASE_URL = "https://sqmicjzafgcymcfdjlai.supabase.co";
 var isProduction = process.env.NODE_ENV === "production";
-var supabaseUrl = (isProduction ? PRODUCTION_SUPABASE_URL : process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || PRODUCTION_SUPABASE_URL).trim();
+var supabaseUrl = (process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || "").trim();
 if (!supabaseUrl) {
   for (const [k, v] of Object.entries(process.env)) {
     if (typeof v !== "string" || !v.trim()) continue;
@@ -5979,10 +5978,9 @@ ${reason ? `\u{1F4DD} \u121D\u12AD\u1295\u12EB\u1275\u1366 ${reason}
     }
   }
   if (isProduction) {
-    const postgresUrl = (process.env.SUPABASE_DB_URL || process.env.DATABASE_URL || process.env.POSTGRES_URL || process.env.POSTGRES_PRISMA_URL || "").trim();
     const serviceKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_SECRET_KEY || "").trim();
-    if (!isPostgresConfigured() || !postgresUrl.toLowerCase().includes("sqmicjzafgcymcfdjlai")) {
-      throw new Error("Production requires a Supabase PostgreSQL connection string for project sqmicjzafgcymcfdjlai in SUPABASE_DB_URL.");
+    if (!isPostgresConfigured()) {
+      throw new Error("Production requires a PostgreSQL connection string in SUPABASE_DB_URL or a supported database URL variable.");
     }
     if (!serviceKey || !getSupabase()) {
       throw new Error("Production requires a valid SUPABASE_SERVICE_ROLE_KEY and SUPABASE_URL.");

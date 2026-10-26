@@ -9,6 +9,7 @@ export interface BingoRoomSnapshot {
   stake: number;
   status: 'waiting' | 'in_progress' | 'finished';
   startsAt: number;
+  serverNow?: number;
   called: number[];
   prizePool: number;
   playerCount: number;

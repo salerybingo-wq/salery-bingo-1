@@ -1858,8 +1858,17 @@ function attachBingoRooms(io) {
       globalRoomInitialization ??= getPostgresBingoRoom(GLOBAL_ROOM_ID).catch((error) => {
         console.warn("Could not restore the global bingo room:", error);
         return null;
-      }).then((storedState) => {
+      }).then(async (storedState) => {
+        const hasNoPlayers = !Array.isArray(storedState?.players) || storedState.players.length === 0;
+        const hasExpiredSelection = storedState?.status === "waiting" && (!Number.isFinite(storedState.startsAt) || storedState.startsAt <= Date.now());
+        if (hasExpiredSelection && hasNoPlayers) {
+          await startSelectionRound(GLOBAL_ROOM_ID, storedState.stake || 10);
+          return localRooms.get(GLOBAL_ROOM_ID);
+        }
         const initialState = storedState || makeRoomState(10, Date.now() + ROOM_JOIN_WINDOW_MS);
+        if (initialState.status === "waiting" && !Number.isFinite(initialState.startsAt)) {
+          initialState.startsAt = Date.now();
+        }
         localRooms.set(GLOBAL_ROOM_ID, initialState);
         if (initialState.status === "waiting") scheduleRoom(GLOBAL_ROOM_ID, initialState);
         else if (initialState.status === "in_progress") void startRoomGame(GLOBAL_ROOM_ID, initialState);

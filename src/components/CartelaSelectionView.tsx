@@ -304,10 +304,7 @@ export const CartelaSelectionView: React.FC<CartelaSelectionViewProps> = ({
 
       const remaining = Math.min(35, computeRemaining(target));
       const hasSelections = selectedCartelaIdsRef.current.length > 0;
-      const displayRemaining = socket?.connected && remaining === 0 && !hasSelections
-        ? 1
-        : remaining;
-      setTimeLeft(displayRemaining);
+      setTimeLeft(remaining);
       if (remaining === 0 && selectedCartelaIdsRef.current.length > 0) {
         void handleJoinGame();
       } else if (remaining === 0 && !socket?.connected && localEmptyResetStartsAtRef.current === 0) {

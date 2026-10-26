@@ -10,7 +10,7 @@ export function minimumLocalTestBalance(...balances: unknown[]): number {
 }
 
 function getGuestSecret(): string {
-  const configuredSecret = process.env.BINGO_GUEST_SECRET || process.env.BOT_TOKEN || '';
+  const configuredSecret = process.env.BINGO_GUEST_SECRET || '';
   if (configuredSecret.length >= 32) return configuredSecret;
   if (process.env.NODE_ENV !== 'production') return 'local-bingo-guest-secret-change-before-deploy';
   return '';

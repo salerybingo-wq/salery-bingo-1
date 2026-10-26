@@ -188,12 +188,7 @@ const schemaSql = `
 
 function getPool(): Pool | null {
   if (pool !== undefined) return pool;
-  const connectionString =
-    process.env.SUPABASE_DB_URL ||
-    process.env.DATABASE_URL ||
-    process.env.POSTGRES_URL ||
-    process.env.POSTGRES_PRISMA_URL ||
-    '';
+  const connectionString = (process.env.SUPABASE_DB_URL || '').trim();
   pool = connectionString
     ? new Pool({
         connectionString,

@@ -347,6 +347,16 @@ export async function getPostgresBingoRoom(roomId: string): Promise<BingoRoomSta
   return result.rows[0]?.state as BingoRoomState || null;
 }
 
+export async function savePostgresBingoRoom(roomId: string, state: BingoRoomState): Promise<void> {
+  const client = getPool();
+  if (!client) throw new Error('PostgreSQL is not configured');
+  await ensureSchema(client);
+  await client.query(
+    'INSERT INTO public.bingo_rooms (room_id, state, updated_at) VALUES ($1, $2::jsonb, NOW()) ON CONFLICT (room_id) DO UPDATE SET state = EXCLUDED.state, updated_at = NOW()',
+    [roomId, JSON.stringify(state)]
+  );
+}
+
 export async function listPostgresBingoRooms(): Promise<Array<{ roomId: string; state: BingoRoomState }>> {
   const client = getPool();
   if (!client) return [];

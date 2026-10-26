@@ -1030,6 +1030,15 @@ async function getPostgresBingoRoom(roomId) {
   const result = await client.query("SELECT state FROM public.bingo_rooms WHERE room_id = $1", [roomId]);
   return result.rows[0]?.state || null;
 }
+async function savePostgresBingoRoom(roomId, state) {
+  const client = getPool();
+  if (!client) throw new Error("PostgreSQL is not configured");
+  await ensureSchema(client);
+  await client.query(
+    "INSERT INTO public.bingo_rooms (room_id, state, updated_at) VALUES ($1, $2::jsonb, NOW()) ON CONFLICT (room_id) DO UPDATE SET state = EXCLUDED.state, updated_at = NOW()",
+    [roomId, JSON.stringify(state)]
+  );
+}
 async function joinPostgresBingoRoom(input) {
   const poolClient = getPool();
   if (!poolClient) return null;
@@ -1588,16 +1597,12 @@ function attachBingoRooms(io) {
       activeDrawTimers.delete(roomId);
     }
     const nextState = makeRoomState(stake, Date.now() + ROOM_JOIN_WINDOW_MS);
+    if (await isPostgresConfigured()) {
+      await savePostgresBingoRoom(roomId, nextState);
+    }
     localRooms.set(roomId, nextState);
     cartelaReservations[stake] = {};
     broadcastCartelaReservations(stake);
-    if (await isPostgresConfigured()) {
-      try {
-        await mutatePostgresBingoRoom(roomId, () => nextState);
-      } catch (error) {
-        console.error(`Could not persist selection round for ${roomId}:`, error);
-      }
-    }
     sendRoomState(io, roomId, nextState);
     scheduleRoom(roomId, nextState);
   };
@@ -1610,7 +1615,9 @@ function attachBingoRooms(io) {
       resetTimers.delete(roomId);
       const currentRoom = localRooms.get(roomId);
       if (currentRoom && currentRoom.status === "finished") {
-        void startSelectionRound(roomId, currentRoom.stake);
+        void startSelectionRound(roomId, currentRoom.stake).catch((error) => {
+          console.error(`Could not start the next selection round for ${roomId}:`, error);
+        });
       }
     }, 5e3);
     resetTimers.set(roomId, timer);
@@ -1849,16 +1856,24 @@ function attachBingoRooms(io) {
         clearInterval(currentCountdown);
         countdownTimers.delete(roomId);
       }
-      await finalizeSelection();
+      try {
+        await finalizeSelection();
+      } catch (error) {
+        console.error(`Could not finalize the selection round for ${roomId}:`, error);
+      }
     }, delay);
     activeTimers.set(roomId, timer);
   };
   const ensureGlobalRoom = () => {
     if (!localRooms.has(GLOBAL_ROOM_ID)) {
       globalRoomInitialization ??= getPostgresBingoRoom(GLOBAL_ROOM_ID).catch((error) => {
-        console.warn("Could not restore the global bingo room:", error);
-        return null;
+        console.error("Could not restore the global bingo room:", error);
+        throw error;
       }).then(async (storedState) => {
+        if (!storedState) {
+          await startSelectionRound(GLOBAL_ROOM_ID, 10);
+          return localRooms.get(GLOBAL_ROOM_ID);
+        }
         const hasNoPlayers = !Array.isArray(storedState?.players) || storedState.players.length === 0;
         const hasExpiredSelection = storedState?.status === "waiting" && (!Number.isFinite(storedState.startsAt) || storedState.startsAt <= Date.now());
         if (hasExpiredSelection && hasNoPlayers) {
@@ -1874,6 +1889,9 @@ function attachBingoRooms(io) {
         else if (initialState.status === "in_progress") void startRoomGame(GLOBAL_ROOM_ID, initialState);
         else if (initialState.status === "finished") scheduleRoomReset(GLOBAL_ROOM_ID);
         return initialState;
+      }).catch((error) => {
+        globalRoomInitialization = null;
+        throw error;
       });
     }
     return Promise.resolve(localRooms.get(GLOBAL_ROOM_ID) || globalRoomInitialization);
@@ -2351,6 +2369,9 @@ function attachBingoRooms(io) {
     }).catch((error) => {
       console.error("Could not initialize the global bingo connection:", error);
     });
+  });
+  void ensureGlobalRoom().catch((error) => {
+    console.error("Could not initialize the global bingo room at server startup:", error);
   });
 }
 

@@ -17,7 +17,7 @@ import { localDb } from './db';
 import { isValidBingoGuestToken } from './guestAuth';
 
 const GLOBAL_ROOM_ID = 'GLOBAL_ROOM';
-const ROOM_JOIN_WINDOW_MS = 35_000;
+let ROOM_JOIN_WINDOW_MS = 35_000;
 const BALL_INTERVAL_MS = 3_000;
 const JOIN_GRACE_MS = 10_000;
 const JOIN_RETRY_MS = 250;
@@ -118,6 +118,7 @@ function makeRoomState(stake: number, startsAt = getNextAlignedStartsAt()): Bing
     stake,
     status: 'waiting',
     startsAt,
+    selectionWindowMs: ROOM_JOIN_WINDOW_MS,
     deck: generateShuffledDeck().map((ball) => ball.number),
     called: [],
     prizePool: 0,
@@ -578,6 +579,11 @@ export function attachBingoRooms(io: Server) {
             return localRooms.get(GLOBAL_ROOM_ID)!;
           }
 
+          if (Number.isInteger(storedState.selectionWindowMs) &&
+              storedState.selectionWindowMs! >= 10_000 &&
+              storedState.selectionWindowMs! <= 120_000) {
+            ROOM_JOIN_WINDOW_MS = storedState.selectionWindowMs!;
+          }
           const hasNoPlayers = !Array.isArray(storedState?.players) || storedState.players.length === 0;
           const hasExpiredSelection = storedState?.status === 'waiting' &&
             (!Number.isFinite(storedState.startsAt) || storedState.startsAt <= Date.now());
@@ -601,6 +607,46 @@ export function attachBingoRooms(io: Server) {
         });
     }
     return Promise.resolve(localRooms.get(GLOBAL_ROOM_ID) || globalRoomInitialization!);
+  };
+
+  const getAdminRoomState = async () => {
+    const state = await ensureGlobalRoom();
+    return publicRoomState(state, getOnlinePlayerIds(io, GLOBAL_ROOM_ID));
+  };
+
+  const resetSelectionRound = async () => {
+    const state = await ensureGlobalRoom();
+    if (state.status !== 'finished' && state.players.length > 0) {
+      throw new Error('Cannot reset a round while players have joined');
+    }
+    await startSelectionRound(GLOBAL_ROOM_ID, state?.stake || 10);
+    return getAdminRoomState();
+  };
+
+  const setSelectionWindow = async (durationMs: number) => {
+    if (!Number.isInteger(durationMs) || durationMs < 10_000 || durationMs > 120_000) {
+      throw new Error('Selection countdown must be between 10000 and 120000 milliseconds');
+    }
+    const state = await ensureGlobalRoom();
+    const nextState = {
+      ...state,
+      selectionWindowMs: durationMs,
+      ...(state.status === 'waiting' ? { startsAt: Date.now() + durationMs } : {}),
+    };
+    if (await isPostgresConfigured()) await savePostgresBingoRoom(GLOBAL_ROOM_ID, nextState);
+    ROOM_JOIN_WINDOW_MS = durationMs;
+    localRooms.set(GLOBAL_ROOM_ID, nextState);
+    if (state.status === 'waiting') {
+      const activeTimer = activeTimers.get(GLOBAL_ROOM_ID);
+      if (activeTimer) clearTimeout(activeTimer);
+      activeTimers.delete(GLOBAL_ROOM_ID);
+      const countdown = countdownTimers.get(GLOBAL_ROOM_ID);
+      if (countdown) clearInterval(countdown);
+      countdownTimers.delete(GLOBAL_ROOM_ID);
+      sendRoomState(io, GLOBAL_ROOM_ID, nextState);
+      scheduleRoom(GLOBAL_ROOM_ID, nextState);
+    }
+    return { selectionWindowMs: ROOM_JOIN_WINDOW_MS, state: await getAdminRoomState() };
   };
 
   io.use((socket, next) => {
@@ -1168,4 +1214,9 @@ export function attachBingoRooms(io: Server) {
   void ensureGlobalRoom().catch((error) => {
     console.error('Could not initialize the global bingo room at server startup:', error);
   });
+  return {
+    getAdminRoomState,
+    resetSelectionRound,
+    setSelectionWindow,
+  };
 }

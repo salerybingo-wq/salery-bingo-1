@@ -780,6 +780,7 @@ var schemaSql = `
     is_verified BOOLEAN DEFAULT false,
     referred_by TEXT,
     share_bonus_awarded BOOLEAN DEFAULT false,
+    initial_play_bonus_credited BOOLEAN NOT NULL DEFAULT true,
     referral_count INTEGER DEFAULT 0,
     total_deposited NUMERIC DEFAULT 0,
     total_withdrawn NUMERIC DEFAULT 0,
@@ -791,11 +792,18 @@ var schemaSql = `
   ALTER TABLE public.users ADD COLUMN IF NOT EXISTS main_wallet NUMERIC;
   ALTER TABLE public.users ADD COLUMN IF NOT EXISTS play_wallet NUMERIC;
   ALTER TABLE public.users ADD COLUMN IF NOT EXISTS share_bonus_awarded BOOLEAN DEFAULT false;
+  ALTER TABLE public.users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT false;
+  ALTER TABLE public.users ADD COLUMN IF NOT EXISTS initial_play_bonus_credited BOOLEAN NOT NULL DEFAULT false;
   UPDATE public.users
     SET main_wallet = COALESCE(main_wallet, balance, 0),
         play_wallet = COALESCE(play_wallet, 0);
+  UPDATE public.users
+    SET play_wallet = COALESCE(play_wallet, 0) + 10,
+        initial_play_bonus_credited = true
+    WHERE initial_play_bonus_credited IS DISTINCT FROM true;
   ALTER TABLE public.users ALTER COLUMN main_wallet SET DEFAULT 0;
-  ALTER TABLE public.users ALTER COLUMN play_wallet SET DEFAULT 0;
+  ALTER TABLE public.users ALTER COLUMN play_wallet SET DEFAULT 10;
+  ALTER TABLE public.users ALTER COLUMN initial_play_bonus_credited SET DEFAULT true;
   UPDATE public.users SET share_bonus_awarded = false WHERE share_bonus_awarded IS NULL;
   ALTER TABLE public.users ALTER COLUMN share_bonus_awarded SET DEFAULT false;
   CREATE TABLE IF NOT EXISTS public.transactions (
@@ -876,6 +884,16 @@ var schemaSql = `
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
   ALTER TABLE public.bingo_wallet_ledger ADD COLUMN IF NOT EXISTS wallet_type TEXT NOT NULL DEFAULT 'main_wallet';
+  CREATE TABLE IF NOT EXISTS public.admin_wallet_adjustments (
+    id BIGSERIAL PRIMARY KEY,
+    admin_telegram_id TEXT NOT NULL,
+    target_telegram_id TEXT NOT NULL,
+    wallet_type TEXT NOT NULL CHECK (wallet_type IN ('main_wallet', 'play_wallet')),
+    requested_delta NUMERIC NOT NULL,
+    applied_delta NUMERIC NOT NULL,
+    reason TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
   CREATE TABLE IF NOT EXISTS public.bingo_platform_commission_ledger (
     idempotency_key TEXT PRIMARY KEY,
     telegram_id TEXT NOT NULL,
@@ -941,6 +959,55 @@ async function ensureSchema(client) {
   }
   await schemaReady;
 }
+async function adjustPostgresUserWallet(adminTelegramId, telegramId, walletType, delta, reason) {
+  const poolClient = getPool();
+  if (!poolClient) return null;
+  await ensureSchema(poolClient);
+  const client = await poolClient.connect();
+  try {
+    await client.query("BEGIN");
+    const found = await client.query(
+      "SELECT balance, main_wallet, play_wallet FROM public.users WHERE telegram_id = $1 FOR UPDATE",
+      [String(telegramId)]
+    );
+    if (!found.rows[0]) {
+      await client.query("ROLLBACK");
+      return null;
+    }
+    const currentMain = Number(found.rows[0].main_wallet ?? found.rows[0].balance ?? 0);
+    const currentPlay = Number(found.rows[0].play_wallet ?? 0);
+    const current = walletType === "main_wallet" ? currentMain : currentPlay;
+    const next = Math.max(0, current + delta);
+    const appliedDelta = next - current;
+    const updated = await client.query(
+      `UPDATE public.users
+       SET ${walletType} = $2,
+           balance = CASE WHEN $3 = 'main_wallet' THEN $2 ELSE COALESCE(main_wallet, balance, 0) END,
+           updated_at = NOW()
+       WHERE telegram_id = $1
+       RETURNING balance, main_wallet, play_wallet`,
+      [String(telegramId), next, walletType]
+    );
+    await client.query(
+      `INSERT INTO public.admin_wallet_adjustments
+       (admin_telegram_id, target_telegram_id, wallet_type, requested_delta, applied_delta, reason)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [String(adminTelegramId), String(telegramId), walletType, delta, appliedDelta, reason || null]
+    );
+    await client.query("COMMIT");
+    return {
+      balance: Number(updated.rows[0].balance),
+      mainWallet: Number(updated.rows[0].main_wallet ?? updated.rows[0].balance),
+      playWallet: Number(updated.rows[0].play_wallet ?? 0),
+      appliedDelta
+    };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => void 0);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
 async function getPostgresUser(telegramId) {
   const client = getPool();
   if (!client) return null;
@@ -987,7 +1054,7 @@ async function upsertPostgresUser(user) {
       user.phone_number || "",
       Number(user.main_wallet ?? user.balance ?? 0),
       Number(user.main_wallet ?? user.balance ?? 0),
-      Number(user.play_wallet ?? 0),
+      Number(user.play_wallet ?? 10),
       user.role || "user",
       user.status || "active",
       user.is_blocked ?? false,
@@ -1464,6 +1531,7 @@ function makeRoomState(stake, startsAt = getNextAlignedStartsAt()) {
     stake,
     status: "waiting",
     startsAt,
+    selectionWindowMs: ROOM_JOIN_WINDOW_MS,
     deck: generateShuffledDeck().map((ball) => ball.number),
     called: [],
     prizePool: 0,
@@ -1874,6 +1942,9 @@ function attachBingoRooms(io) {
           await startSelectionRound(GLOBAL_ROOM_ID, 10);
           return localRooms.get(GLOBAL_ROOM_ID);
         }
+        if (Number.isInteger(storedState.selectionWindowMs) && storedState.selectionWindowMs >= 1e4 && storedState.selectionWindowMs <= 12e4) {
+          ROOM_JOIN_WINDOW_MS = storedState.selectionWindowMs;
+        }
         const hasNoPlayers = !Array.isArray(storedState?.players) || storedState.players.length === 0;
         const hasExpiredSelection = storedState?.status === "waiting" && (!Number.isFinite(storedState.startsAt) || storedState.startsAt <= Date.now());
         if (hasExpiredSelection && hasNoPlayers) {
@@ -1895,6 +1966,43 @@ function attachBingoRooms(io) {
       });
     }
     return Promise.resolve(localRooms.get(GLOBAL_ROOM_ID) || globalRoomInitialization);
+  };
+  const getAdminRoomState = async () => {
+    const state = await ensureGlobalRoom();
+    return publicRoomState(state, getOnlinePlayerIds(io, GLOBAL_ROOM_ID));
+  };
+  const resetSelectionRound = async () => {
+    const state = await ensureGlobalRoom();
+    if (state.status !== "finished" && state.players.length > 0) {
+      throw new Error("Cannot reset a round while players have joined");
+    }
+    await startSelectionRound(GLOBAL_ROOM_ID, state?.stake || 10);
+    return getAdminRoomState();
+  };
+  const setSelectionWindow = async (durationMs) => {
+    if (!Number.isInteger(durationMs) || durationMs < 1e4 || durationMs > 12e4) {
+      throw new Error("Selection countdown must be between 10000 and 120000 milliseconds");
+    }
+    const state = await ensureGlobalRoom();
+    const nextState = {
+      ...state,
+      selectionWindowMs: durationMs,
+      ...(state.status === "waiting" ? { startsAt: Date.now() + durationMs } : {})
+    };
+    if (await isPostgresConfigured()) await savePostgresBingoRoom(GLOBAL_ROOM_ID, nextState);
+    ROOM_JOIN_WINDOW_MS = durationMs;
+    localRooms.set(GLOBAL_ROOM_ID, nextState);
+    if (state.status === "waiting") {
+      const activeTimer = activeTimers.get(GLOBAL_ROOM_ID);
+      if (activeTimer) clearTimeout(activeTimer);
+      activeTimers.delete(GLOBAL_ROOM_ID);
+      const countdown = countdownTimers.get(GLOBAL_ROOM_ID);
+      if (countdown) clearInterval(countdown);
+      countdownTimers.delete(GLOBAL_ROOM_ID);
+      sendRoomState(io, GLOBAL_ROOM_ID, nextState);
+      scheduleRoom(GLOBAL_ROOM_ID, nextState);
+    }
+    return { selectionWindowMs: ROOM_JOIN_WINDOW_MS, state: await getAdminRoomState() };
   };
   io.use((socket, next) => {
     const auth = socket.handshake.auth || {};
@@ -2373,6 +2481,7 @@ function attachBingoRooms(io) {
   void ensureGlobalRoom().catch((error) => {
     console.error("Could not initialize the global bingo room at server startup:", error);
   });
+  return { getAdminRoomState, resetSelectionRound, setSelectionWindow };
 }
 
 // server.ts
@@ -2503,6 +2612,8 @@ async function upsertUserAdaptive(payload) {
   } catch {
   }
   let currentPayload = { ...payload };
+  if (currentPayload.play_wallet === void 0) currentPayload.play_wallet = 10;
+  if (currentPayload.initial_play_bonus_credited === void 0) currentPayload.initial_play_bonus_credited = true;
   for (let attempt = 0; attempt < 8; attempt++) {
     const res = await client.from("users").insert([currentPayload]).select().maybeSingle();
     if (!res.error) {
@@ -2595,7 +2706,7 @@ function isAdminUser(id) {
   if (process.env.ADMIN_IDS && process.env.ADMIN_IDS.split(",").map((s) => s.trim()).includes(sId)) return true;
   try {
     const user = localDb.getUser(sId);
-    if (user && user.role === "admin") return true;
+    if (user && (user.role === "admin" || user.is_admin === true)) return true;
   } catch {
   }
   return false;
@@ -2652,17 +2763,40 @@ function getVerifiedRequestUser(req) {
     isLoopbackClientAllowed(req.headers.origin, req.socket.remoteAddress)
   );
 }
-function requireVerifiedAdmin(req, res) {
+async function requireVerifiedAdmin(req, res) {
   const user = getVerifiedRequestUser(req);
   if (!user) {
     res.status(401).json({ ok: false, error: "Verified Telegram WebApp authentication is required" });
     return false;
   }
-  if (!isAdminUser(user.id)) {
-    res.status(403).json({ ok: false, error: "Admin access required" });
+  const adminIds = new Set(["5873620165", "908336796", ...(process.env.ADMIN_IDS || "").split(",").map((id) => id.trim()).filter(Boolean)]);
+  if (adminIds.has(String(user.id))) return true;
+  let postgresUser = null;
+  if (isPostgresConfigured()) {
+    postgresUser = await getPostgresUser(user.id);
+    if (postgresUser?.role === "admin" || postgresUser?.is_admin === true) return true;
+  }
+  const client = getSupabase();
+  if (client) {
+    const { data: supabaseUser, error } = await client.from("users").select("*").eq("telegram_id", String(user.id)).maybeSingle();
+    if (error) {
+      console.error("Could not verify admin role from Supabase:", error);
+      res.status(503).json({ ok: false, error: "Could not verify admin privileges" });
+      return false;
+    }
+    if (supabaseUser?.role === "admin" || supabaseUser?.is_admin === true) return true;
+    if (supabaseUser) {
+      res.status(403).json({ ok: false, error: "Admin access required" });
+      return false;
+    }
+  }
+  if (!isPostgresConfigured() && !client && isAdminUser(user.id)) return true;
+  if (!postgresUser && !client) {
+    res.status(503).json({ ok: false, error: "Admin role storage is unavailable" });
     return false;
   }
-  return true;
+  res.status(403).json({ ok: false, error: "Admin access required" });
+  return false;
 }
 function requireVerifiedPlayer(req, res, telegramId) {
   const user = getVerifiedRequestUser(req);
@@ -4596,7 +4730,7 @@ async function startServer() {
     },
     transports: ["websocket", "polling"]
   });
-  attachBingoRooms(socketServer);
+  const roomController = attachBingoRooms(socketServer);
   app.use(
     cors({
       origin: (_origin, callback) => callback(null, true),
@@ -4607,6 +4741,14 @@ async function startServer() {
   );
   app.use(express.json({ limit: "25mb" }));
   app.use(express.urlencoded({ extended: true, limit: "25mb" }));
+  app.use("/api/admin", (req, res, next) => {
+    void requireVerifiedAdmin(req, res).then((allowed) => {
+      if (allowed) next();
+    }).catch((error) => {
+      console.error("Admin request authentication failed:", error);
+      if (!res.headersSent) res.status(503).json({ ok: false, error: "Could not verify admin privileges" });
+    });
+  });
   app.use((req, res, next) => {
     try {
       const originHeader = req.headers.origin || req.headers.referer;
@@ -4633,6 +4775,144 @@ async function startServer() {
       supabaseConnected: !!supabase,
       timestamp: /* @__PURE__ */ new Date()
     });
+  });
+  app.get("/api/admin/room", async (_req, res) => {
+    try {
+      res.json({
+        ok: true,
+        room: await roomController.getAdminRoomState(),
+        selectionWindowMs: ROOM_JOIN_WINDOW_MS
+      });
+    } catch (error) {
+      console.error("Could not load admin room state:", error);
+      res.status(503).json({ ok: false, error: "Could not load room state" });
+    }
+  });
+  app.post("/api/admin/room/reset", async (_req, res) => {
+    try {
+      const room = await roomController.resetSelectionRound();
+      res.json({ ok: true, room });
+    } catch (error) {
+      const message = error?.message || "Could not reset selection round";
+      res.status(message.includes("players have joined") ? 409 : 503).json({ ok: false, error: message });
+    }
+  });
+  app.put("/api/admin/room/settings", async (req, res) => {
+    const { selectionWindowMs } = req.body || {};
+    if (!Number.isInteger(selectionWindowMs)) {
+      return res.status(400).json({ ok: false, error: "selectionWindowMs must be an integer" });
+    }
+    if (selectionWindowMs < 10_000 || selectionWindowMs > 120_000) {
+      return res.status(400).json({ ok: false, error: "selectionWindowMs must be between 10000 and 120000" });
+    }
+    try {
+      res.json({ ok: true, ...(await roomController.setSelectionWindow(selectionWindowMs)) });
+    } catch (error) {
+      console.error("Could not save admin room settings:", error);
+      res.status(503).json({ ok: false, error: "Could not save room settings" });
+    }
+  });
+  app.get("/api/admin/active-users", async (_req, res) => {
+    try {
+      let users;
+      if (isPostgresConfigured()) {
+        users = await getPostgresUsers();
+        if (!users) throw new Error("PostgreSQL user list is unavailable");
+      } else {
+        const client = getSupabase();
+        if (client) {
+          const { data, error } = await client.from("users").select("*").order("created_at", { ascending: false });
+          if (error) throw error;
+          users = data || [];
+        } else {
+          users = localDb.getAllUsers();
+        }
+      }
+      const activeUsers = users.filter((user) => user.status !== "blocked" && user.is_blocked !== true)
+        .map((user) => ({
+          telegram_id: String(user.telegram_id),
+          first_name: user.first_name || user.full_name || "Player",
+          username: user.username || "",
+          role: user.role || (user.is_admin === true ? "admin" : "user"),
+          main_wallet: Number(user.main_wallet ?? user.balance ?? 0),
+          play_wallet: Number(user.play_wallet ?? 0),
+          status: user.status || "active",
+          last_seen_at: user.last_seen_at || null
+        }));
+      res.json({ ok: true, users: activeUsers, totalActive: activeUsers.length });
+    } catch (error) {
+      console.error("Could not load active users for admin:", error);
+      res.status(503).json({ ok: false, error: "Could not load active users" });
+    }
+  });
+  app.get("/api/admin/wallets/summary", async (_req, res) => {
+    try {
+      let users;
+      if (isPostgresConfigured()) {
+        users = await getPostgresUsers();
+        if (!users) throw new Error("PostgreSQL user list is unavailable");
+      } else {
+        const client = getSupabase();
+        if (client) {
+          const { data, error } = await client.from("users").select("telegram_id,balance,main_wallet,play_wallet,status,is_blocked");
+          if (error) throw error;
+          users = data || [];
+        } else {
+          users = localDb.getAllUsers();
+        }
+      }
+      const totalMainWallet = users.reduce((sum, user) => sum + Number(user.main_wallet ?? user.balance ?? 0), 0);
+      const totalPlayWallet = users.reduce((sum, user) => sum + Number(user.play_wallet ?? 0), 0);
+      res.json({
+        ok: true,
+        userCount: users.length,
+        totalMainWallet,
+        totalPlayWallet,
+        totalWalletBalance: totalMainWallet + totalPlayWallet,
+        activeUsers: users.filter((user) => user.status !== "blocked" && user.is_blocked !== true).length,
+        blockedUsers: users.filter((user) => user.status === "blocked" || user.is_blocked === true).length
+      });
+    } catch (error) {
+      console.error("Could not calculate admin wallet summary:", error);
+      res.status(503).json({ ok: false, error: "Could not calculate wallet totals" });
+    }
+  });
+  app.post("/api/admin/user/:telegramId/wallet", async (req, res) => {
+    if (!isPostgresConfigured()) {
+      return res.status(503).json({ ok: false, error: "PostgreSQL wallet storage is required for wallet adjustments" });
+    }
+    const telegramId = String(req.params.telegramId);
+    const { walletType, delta, reason } = req.body || {};
+    if (!/^\d+$/.test(telegramId) ||
+        !["main_wallet", "play_wallet"].includes(walletType) ||
+        typeof delta !== "number" || !Number.isFinite(delta) ||
+        delta === 0 || Math.abs(delta) > 1_000_000_000) {
+      return res.status(400).json({ ok: false, error: "Provide a valid Telegram ID, walletType, and non-zero delta" });
+    }
+    try {
+      const admin = getVerifiedRequestUser(req);
+      const wallets = await adjustPostgresUserWallet(
+        admin.id,
+        telegramId,
+        walletType,
+        delta,
+        typeof reason === "string" ? reason.trim().slice(0, 500) : ""
+      );
+      if (!wallets) return res.status(404).json({ ok: false, error: "User not found" });
+      for (const client of socketServer.sockets.sockets.values()) {
+        if (String(client.data?.player?.id) === telegramId) {
+          client.emit("wallet:balance", {
+            balance: wallets.balance,
+            mainWallet: wallets.mainWallet,
+            playWallet: wallets.playWallet
+          });
+        }
+      }
+      res.json({ ok: true, telegramId, ...wallets });
+    } catch (error) {
+      console.error(`Could not adjust ${walletType} for ${telegramId}:`, error);
+      res.status(500).json({ ok: false, error: "Could not adjust user wallet" });
+    }
   });
   app.get("/api/admin/database/status", (req, res) => {
     res.json(localDb.getStatus());
@@ -4691,7 +4971,7 @@ async function startServer() {
               });
             }
           }
-          const playWallet2 = Number(existingAccount.play_wallet ?? 0);
+          const playWallet2 = Number(existingAccount.play_wallet ?? 10);
           return res.json({
             ok: true,
             playerId: existingPlayerId,
@@ -4719,7 +4999,8 @@ async function startServer() {
           username: `player_${id.slice(-4)}`,
           balance: localTestBalance,
           main_wallet: localTestBalance,
-          play_wallet: 0,
+          play_wallet: 10,
+          initial_play_bonus_credited: true,
           role: "user",
           status: "active",
           is_blocked: false,
@@ -4767,9 +5048,7 @@ async function startServer() {
       if (!telegramId) return res.status(400).json({ ok: false, error: "telegramId is required" });
       if (!requireVerifiedPlayer(req, res, String(telegramId))) return;
       const tId = String(telegramId);
-      const isAdm = isAdminUser(tId);
       const telegramUser = getVerifiedRequestUser(req);
-      const userRole = isAdm ? "admin" : "user";
       const code = generatePlayerCode(tId);
       const telegramFirstName = telegramUser.first_name || "Player";
       const telegramFullName = [telegramUser.first_name, telegramUser.last_name].filter(Boolean).join(" ") || "Player";
@@ -4788,6 +5067,10 @@ async function startServer() {
           console.warn("Supabase user lookup threw during Telegram registration:", error);
         }
       }
+      const isAdm = isAdminUser(tId) ||
+        postgresExisting?.role === "admin" || postgresExisting?.is_admin === true ||
+        supabaseExisting?.role === "admin" || supabaseExisting?.is_admin === true;
+      const userRole = isAdm ? "admin" : "user";
       let existing = postgresExisting ? localDb.upsertUser({
         telegram_id: tId,
         player_code: postgresExisting.player_code,
@@ -4798,7 +5081,9 @@ async function startServer() {
         balance: Number(postgresExisting.main_wallet ?? postgresExisting.balance ?? 0),
         main_wallet: Number(postgresExisting.main_wallet ?? postgresExisting.balance ?? 0),
         play_wallet: Number(postgresExisting.play_wallet ?? 0),
+        initial_play_bonus_credited: postgresExisting.initial_play_bonus_credited === true,
         role: postgresExisting.role || userRole,
+        is_admin: postgresExisting.is_admin === true,
         status: postgresExisting.status,
         is_blocked: !!postgresExisting.is_blocked,
         is_verified: !!postgresExisting.is_verified,
@@ -4813,7 +5098,9 @@ async function startServer() {
         balance: Number(supabaseExisting.main_wallet ?? supabaseExisting.balance ?? 0),
         main_wallet: Number(supabaseExisting.main_wallet ?? supabaseExisting.balance ?? 0),
         play_wallet: Number(supabaseExisting.play_wallet ?? 0),
+        initial_play_bonus_credited: supabaseExisting.initial_play_bonus_credited === true,
         role: supabaseExisting.role || userRole,
+        is_admin: supabaseExisting.is_admin === true,
         status: supabaseExisting.status,
         is_blocked: !!supabaseExisting.is_blocked,
         is_verified: !!supabaseExisting.is_verified,
@@ -4828,14 +5115,19 @@ async function startServer() {
         username: telegramUser.username || existing?.username || "",
         phone_number: existing?.phone_number || "",
         balance: finalBalance,
+        play_wallet: existing
+          ? Number(existing.play_wallet ?? 0) + (existing.initial_play_bonus_credited === true ? 0 : 10)
+          : 10,
+        initial_play_bonus_credited: true,
         role: userRole,
+        is_admin: isAdm,
         status: existing?.status || "active",
         is_blocked: !!existing?.is_blocked,
         is_verified: !!existing?.is_verified,
         referred_by: referredBy || existing?.referred_by
       });
       const mainWallet = Number(updatedUser.main_wallet ?? finalBalance);
-      const playWallet = Number(updatedUser.play_wallet ?? 0);
+      let playWallet = Number(updatedUser.play_wallet ?? 10);
       const postgresUser = await upsertPostgresUser({
         telegram_id: tId,
         player_code: code,
@@ -4855,6 +5147,20 @@ async function startServer() {
         console.warn("PostgreSQL user upsert failed:", err);
         return null;
       });
+      if (isPostgresConfigured() && !postgresUser) {
+        return res.status(503).json({ ok: false, error: "Could not save player account and play-wallet bonus" });
+      }
+      if (postgresUser) {
+        playWallet = Number(postgresUser.play_wallet ?? playWallet);
+        localDb.upsertUser({
+          ...updatedUser,
+          balance: Number(postgresUser.balance ?? finalBalance),
+          main_wallet: Number(postgresUser.main_wallet ?? postgresUser.balance ?? mainWallet),
+          play_wallet: playWallet,
+          role: postgresUser.role || userRole,
+          is_admin: postgresUser.is_admin === true || postgresUser.role === "admin"
+        });
+      }
       let supaSynced = false;
       if (client) {
         try {
@@ -4868,6 +5174,7 @@ async function startServer() {
             balance: finalBalance,
             main_wallet: mainWallet,
             play_wallet: playWallet,
+            initial_play_bonus_credited: true,
             role: userRole,
             status: updatedUser.status,
             is_blocked: updatedUser.is_blocked,
@@ -4883,8 +5190,10 @@ async function startServer() {
       }
       return res.json({
         ok: true,
-        user: updatedUser,
+        user: { ...updatedUser, play_wallet: playWallet, playWallet },
         balance: finalBalance,
+        mainWallet,
+        playWallet,
         postgresSynced: !!postgresUser,
         supabaseSynced: supaSynced,
         supabaseConnected: !!client,
@@ -4917,7 +5226,10 @@ async function startServer() {
             username: supaUser.username || "",
             phone_number: supaUser.phone_number || "",
             balance: Number(supaUser.balance ?? 0),
-            role: supaUser.role || (isAdminUser(telegramId) ? "admin" : "user"),
+            main_wallet: Number(supaUser.main_wallet ?? supaUser.balance ?? 0),
+            play_wallet: Number(supaUser.play_wallet ?? 10),
+            role: supaUser.role || (supaUser.is_admin === true || isAdminUser(telegramId) ? "admin" : "user"),
+            is_admin: supaUser.is_admin === true,
             status: supaUser.status || (supaUser.is_blocked ? "blocked" : "active"),
             is_blocked: !!supaUser.is_blocked || supaUser.status === "blocked",
             is_verified: !!supaUser.is_verified || !!supaUser.phone_number
@@ -4930,7 +5242,7 @@ async function startServer() {
     if (!fullUser) {
       const devRole = isAdminUser(telegramId) ? "admin" : "user";
       const devBalance = 0;
-      const devPlay = 0;
+      const devPlay = 10;
       fullUser = localDb.upsertUser({
         telegram_id: telegramId,
         balance: devBalance,
@@ -4943,7 +5255,11 @@ async function startServer() {
           telegram_id: telegramId,
           player_code: fullUser.player_code,
           balance: fullUser.balance,
-          role: fullUser.role
+          main_wallet: fullUser.main_wallet,
+          play_wallet: fullUser.play_wallet,
+          initial_play_bonus_credited: true,
+          role: fullUser.role,
+          is_admin: fullUser.is_admin
         }).catch(() => {
         });
       }
@@ -4961,9 +5277,9 @@ async function startServer() {
       localDb.updateUserBalance(telegramId, mainWallet);
       fullUser = { ...fullUser, balance: mainWallet, main_wallet: mainWallet };
     }
-    const playWallet = Number(postgresUser?.play_wallet ?? fullUser?.play_wallet ?? 0);
+    const playWallet = Number(postgresUser?.play_wallet ?? fullUser?.play_wallet ?? 10);
     const balance = mainWallet;
-    const isAdmin = isAdminUser(telegramId);
+    const isAdmin = isAdminUser(telegramId) || postgresUser?.role === "admin" || postgresUser?.is_admin === true || fullUser.is_admin === true;
     const playerCode = fullUser.player_code || generatePlayerCode(telegramId);
     const role = isAdmin ? "admin" : fullUser.role || "user";
     const isBlocked = fullUser.status === "blocked" || fullUser.is_blocked === true;
@@ -4980,12 +5296,12 @@ async function startServer() {
       isBlocked,
       ban_reason: isBlocked ? banReason || "\u12E8\u12A0\u1308\u120D\u130D\u120E\u1275 \u12F0\u1295\u1265 \u1218\u1323\u1235" : void 0,
       user: fullUser,
+      is_admin: isAdmin,
       databaseType: isPostgresConfigured() ? "postgres" : client ? "supabase_realtime_hybrid" : "local_secure",
       supabaseConnected: !!client
     });
   });
   app.get("/api/admin/users", async (req, res) => {
-    if (!requireVerifiedAdmin(req, res)) return;
     try {
       const client = getSupabase();
       const postgresUsers = await getPostgresUsers().catch((err) => {
@@ -5003,7 +5319,10 @@ async function startServer() {
             username: user.username || "",
             phone_number: user.phone_number || "",
             balance: Number(user.balance ?? 0),
-            role: user.role || (String(user.telegram_id) === "908336796" ? "admin" : "user"),
+            main_wallet: Number(user.main_wallet ?? user.balance ?? 0),
+            play_wallet: Number(user.play_wallet ?? 0),
+            role: user.role || (user.is_admin === true || String(user.telegram_id) === "908336796" ? "admin" : "user"),
+            is_admin: user.is_admin === true,
             status: user.status || (user.is_blocked ? "blocked" : "active"),
             is_blocked: !!user.is_blocked || user.status === "blocked",
             ban_reason: user.ban_reason,
@@ -5026,7 +5345,10 @@ async function startServer() {
                   username: su.username || "",
                   phone_number: su.phone_number || "",
                   balance: Number(su.balance ?? 0),
-                  role: su.role || (String(su.telegram_id) === "908336796" ? "admin" : "user"),
+                  main_wallet: Number(su.main_wallet ?? su.balance ?? 0),
+                  play_wallet: Number(su.play_wallet ?? 0),
+                  role: su.role || (su.is_admin === true || String(su.telegram_id) === "908336796" ? "admin" : "user"),
+                  is_admin: su.is_admin === true,
                   status: su.status || (su.is_blocked ? "blocked" : "active"),
                   is_blocked: !!su.is_blocked || su.status === "blocked",
                   ban_reason: su.ban_reason,
@@ -5041,7 +5363,7 @@ async function startServer() {
       }
       const allDbUsers = localDb.getAllUsers().map((u) => {
         const tId = String(u.telegram_id);
-        const isAdmin = isAdminUser(tId);
+        const isAdmin = isAdminUser(tId) || u.is_admin === true;
         const code = u.player_code || generatePlayerCode(tId);
         const role = isAdmin ? "admin" : u.role || "user";
         const isBlocked = u.status === "blocked" || u.is_blocked === true;
@@ -5056,7 +5378,10 @@ async function startServer() {
           username: u.username || "",
           phone_number: u.phone_number || "",
           balance,
+          main_wallet: Number(u.main_wallet ?? balance),
+          play_wallet: Number(u.play_wallet ?? 0),
           role,
+          is_admin: isAdmin,
           status: isBlocked ? "blocked" : "active",
           is_blocked: isBlocked,
           ban_reason: isBlocked ? banReason || "\u12E8\u12A0\u1308\u120D\u130D\u120E\u1275 \u12F0\u1295\u1265 \u1218\u1323\u1235" : void 0,
@@ -5064,7 +5389,7 @@ async function startServer() {
           created_at: u.created_at || (/* @__PURE__ */ new Date()).toISOString()
         };
       });
-      const usersList = allDbUsers.filter((u) => u.role !== "admin" && !isAdminUser(u.telegram_id));
+      const usersList = allDbUsers.filter((u) => u.role !== "admin" && !u.is_admin && !isAdminUser(u.telegram_id));
       const totalBalance = usersList.reduce((sum, u) => sum + (u.balance || 0), 0);
       const totalActive = usersList.filter((u) => u.status !== "blocked").length;
       const dbStatus = localDb.getStatus();
@@ -5121,7 +5446,6 @@ async function startServer() {
     }
   });
   app.post("/api/admin/user/:telegramId/balance", async (req, res) => {
-    if (!requireVerifiedAdmin(req, res)) return;
     if (!isPostgresConfigured()) {
       return res.status(503).json({ ok: false, error: "PostgreSQL wallet storage is required for balance changes" });
     }
@@ -5221,7 +5545,6 @@ ${reason ? `\u{1F4DD} \u121D\u12AD\u1295\u12EB\u1275\u1366 ${reason}
     });
   });
   app.post("/api/admin/broadcast", async (req, res) => {
-    if (!requireVerifiedAdmin(req, res)) return;
     const { message, targetTelegramId, photoUrl, photoTitle, botToken: bodyToken } = req.body;
     const botToken = bodyToken || getActiveBotToken(req);
     if (!message && !photoUrl) {
@@ -5813,7 +6136,6 @@ ${reason ? `\u{1F4DD} \u121D\u12AD\u1295\u12EB\u1275\u1366 ${reason}
     return res.status(404).json({ ok: false, error: "Transaction not found" });
   });
   app.post("/api/admin/transactions/:id/status", async (req, res) => {
-    if (!requireVerifiedAdmin(req, res)) return;
     if (!isPostgresConfigured()) {
       return res.status(503).json({ ok: false, error: "PostgreSQL wallet storage is required for transaction approval" });
     }

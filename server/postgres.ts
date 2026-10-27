@@ -11,6 +11,7 @@ export interface PostgresUser {
   main_wallet?: number;
   play_wallet?: number;
   role?: string;
+  is_admin?: boolean;
   status?: string;
   is_blocked?: boolean;
   ban_reason?: string;
@@ -49,6 +50,7 @@ export interface BingoRoomState {
   stake: number;
   status: 'waiting' | 'in_progress' | 'finished';
   startsAt: number;
+  selectionWindowMs?: number;
   nextBallAt?: number;
   deck: number[];
   called: number[];
@@ -75,12 +77,14 @@ const schemaSql = `
     main_wallet NUMERIC DEFAULT 0,
     play_wallet NUMERIC DEFAULT 0,
     role TEXT DEFAULT 'user',
+    is_admin BOOLEAN DEFAULT false,
     status TEXT DEFAULT 'active',
     is_blocked BOOLEAN DEFAULT false,
     ban_reason TEXT,
     is_verified BOOLEAN DEFAULT false,
     referred_by TEXT,
     share_bonus_awarded BOOLEAN DEFAULT false,
+    initial_play_bonus_credited BOOLEAN NOT NULL DEFAULT true,
     referral_count INTEGER DEFAULT 0,
     total_deposited NUMERIC DEFAULT 0,
     total_withdrawn NUMERIC DEFAULT 0,
@@ -92,11 +96,18 @@ const schemaSql = `
   ALTER TABLE public.users ADD COLUMN IF NOT EXISTS main_wallet NUMERIC;
   ALTER TABLE public.users ADD COLUMN IF NOT EXISTS play_wallet NUMERIC;
   ALTER TABLE public.users ADD COLUMN IF NOT EXISTS share_bonus_awarded BOOLEAN DEFAULT false;
+  ALTER TABLE public.users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT false;
+  ALTER TABLE public.users ADD COLUMN IF NOT EXISTS initial_play_bonus_credited BOOLEAN NOT NULL DEFAULT false;
   UPDATE public.users
     SET main_wallet = COALESCE(main_wallet, balance, 0),
         play_wallet = COALESCE(play_wallet, 0);
+  UPDATE public.users
+    SET play_wallet = COALESCE(play_wallet, 0) + 10,
+        initial_play_bonus_credited = true
+    WHERE initial_play_bonus_credited = false;
   ALTER TABLE public.users ALTER COLUMN main_wallet SET DEFAULT 0;
-  ALTER TABLE public.users ALTER COLUMN play_wallet SET DEFAULT 0;
+  ALTER TABLE public.users ALTER COLUMN play_wallet SET DEFAULT 10;
+  ALTER TABLE public.users ALTER COLUMN initial_play_bonus_credited SET DEFAULT true;
   UPDATE public.users SET share_bonus_awarded = false WHERE share_bonus_awarded IS NULL;
   ALTER TABLE public.users ALTER COLUMN share_bonus_awarded SET DEFAULT false;
   CREATE TABLE IF NOT EXISTS public.transactions (
@@ -177,6 +188,16 @@ const schemaSql = `
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
   ALTER TABLE public.bingo_wallet_ledger ADD COLUMN IF NOT EXISTS wallet_type TEXT NOT NULL DEFAULT 'main_wallet';
+  CREATE TABLE IF NOT EXISTS public.admin_wallet_adjustments (
+    id BIGSERIAL PRIMARY KEY,
+    admin_telegram_id TEXT NOT NULL,
+    target_telegram_id TEXT NOT NULL,
+    wallet_type TEXT NOT NULL CHECK (wallet_type IN ('main_wallet', 'play_wallet')),
+    requested_delta NUMERIC NOT NULL,
+    applied_delta NUMERIC NOT NULL,
+    reason TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
   CREATE TABLE IF NOT EXISTS public.bingo_platform_commission_ledger (
     idempotency_key TEXT PRIMARY KEY,
     telegram_id TEXT NOT NULL,
@@ -300,7 +321,7 @@ export async function upsertPostgresUser(user: PostgresUser): Promise<Record<str
     [
       String(user.telegram_id), user.player_code || '', user.first_name || '', user.full_name || '',
       user.username || '', user.phone_number || '', Number(user.main_wallet ?? user.balance ?? 0),
-      Number(user.main_wallet ?? user.balance ?? 0), Number(user.play_wallet ?? 0), user.role || 'user',
+      Number(user.main_wallet ?? user.balance ?? 0),       Number(user.play_wallet ?? 10), user.role || 'user',
       user.status || 'active', user.is_blocked ?? false, user.ban_reason || null,
       user.is_verified ?? false, user.referred_by || null,
     ]
@@ -337,6 +358,63 @@ export async function setPostgresUserWallets(
     mainWallet: Number(result.rows[0].main_wallet),
     playWallet: Number(result.rows[0].play_wallet),
   };
+}
+
+export async function adjustPostgresUserWallet(
+  adminTelegramId: string | number,
+  telegramId: string | number,
+  walletType: 'main_wallet' | 'play_wallet',
+  delta: number,
+  reason?: string
+): Promise<{ balance: number; mainWallet: number; playWallet: number; appliedDelta: number } | null> {
+  const poolClient = getPool();
+  if (!poolClient) return null;
+  await ensureSchema(poolClient);
+  const client = await poolClient.connect();
+  try {
+    await client.query('BEGIN');
+    const found = await client.query(
+      'SELECT balance, main_wallet, play_wallet FROM public.users WHERE telegram_id = $1 FOR UPDATE',
+      [String(telegramId)]
+    );
+    if (!found.rows[0]) {
+      await client.query('ROLLBACK');
+      return null;
+    }
+
+    const currentMain = Number(found.rows[0].main_wallet ?? found.rows[0].balance ?? 0);
+    const currentPlay = Number(found.rows[0].play_wallet ?? 0);
+    const current = walletType === 'main_wallet' ? currentMain : currentPlay;
+    const next = Math.max(0, current + delta);
+    const appliedDelta = next - current;
+    const updated = await client.query(
+      `UPDATE public.users
+       SET ${walletType} = $2,
+           balance = CASE WHEN $3 = 'main_wallet' THEN $2 ELSE COALESCE(main_wallet, balance, 0) END,
+           updated_at = NOW()
+       WHERE telegram_id = $1
+       RETURNING balance, main_wallet, play_wallet`,
+      [String(telegramId), next, walletType]
+    );
+    await client.query(
+      `INSERT INTO public.admin_wallet_adjustments
+       (admin_telegram_id, target_telegram_id, wallet_type, requested_delta, applied_delta, reason)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [String(adminTelegramId), String(telegramId), walletType, delta, appliedDelta, reason || null]
+    );
+    await client.query('COMMIT');
+    return {
+      balance: Number(updated.rows[0].balance),
+      mainWallet: Number(updated.rows[0].main_wallet ?? updated.rows[0].balance),
+      playWallet: Number(updated.rows[0].play_wallet ?? 0),
+      appliedDelta,
+    };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 export async function getPostgresBingoRoom(roomId: string): Promise<BingoRoomState | null> {

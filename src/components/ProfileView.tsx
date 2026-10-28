@@ -18,6 +18,10 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
   onUpdateSettings,
   onOpenAdminPanel,
 }) => {
+  const isAdmin =
+    String(user.telegramId) === '5873620165' ||
+    String(user.telegramId) === '908336796' ||
+    user.role === 'admin';
   const rawDisplayName = user.firstName || user.username || 'Player';
   const initial = rawDisplayName.charAt(0).toUpperCase();
   const displayName = user.firstName ? user.firstName : (user.username ? `@${user.username}` : 'Player');
@@ -260,7 +264,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
         </div>
 
         {/* Admin Panel Quick Access */}
-        {onOpenAdminPanel && (
+        {isAdmin && onOpenAdminPanel && (
           <div className="pt-2">
             <button
               type="button"

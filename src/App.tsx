@@ -120,20 +120,8 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<NavTab>('game');
   const [showAdminPanel, setShowAdminPanel] = useState(() => checkIsAdminRoute());
 
-  // Listen to popstate to toggle admin view on hash change
-  useEffect(() => {
-    const handleHashChange = () => {
-      setShowAdminPanel(checkIsAdminRoute());
-    };
-    window.addEventListener('hashchange', handleHashChange);
-    window.addEventListener('popstate', handleHashChange);
-    return () => {
-      window.removeEventListener('hashchange', handleHashChange);
-      window.removeEventListener('popstate', handleHashChange);
-    };
-  }, []);
-
   const handleOpenAdminPanel = () => {
+    if (!isAdmin) return;
     sounds.playBeep(true);
     setShowAdminPanel(true);
     if (typeof window !== 'undefined') {
@@ -212,6 +200,23 @@ export default function App() {
     }
     return initialProfile;
   });
+  const isAdmin =
+    String(user.telegramId) === '5873620165' ||
+    String(user.telegramId) === '908336796' ||
+    user.role === 'admin';
+
+  useEffect(() => {
+    const handleHashChange = () => {
+      setShowAdminPanel(isAdmin && checkIsAdminRoute());
+    };
+    handleHashChange();
+    window.addEventListener('hashchange', handleHashChange);
+    window.addEventListener('popstate', handleHashChange);
+    return () => {
+      window.removeEventListener('hashchange', handleHashChange);
+      window.removeEventListener('popstate', handleHashChange);
+    };
+  }, [isAdmin]);
 
   const [isRefreshingBalance, setIsRefreshingBalance] = useState(false);
 
@@ -1340,7 +1345,7 @@ export default function App() {
 
   const isLiveGameActive = status === 'starting' || status === 'in_progress' || status === 'paused' || status === 'countdown' || status === 'game_over';
 
-  if (showAdminPanel) {
+  if (showAdminPanel && isAdmin) {
     return (
       <div className="min-h-screen bg-[#040810] text-slate-100">
         <AdminPanelView
@@ -1471,7 +1476,7 @@ export default function App() {
           user={user}
           settings={settings}
           onUpdateSettings={(newSettings) => setSettings((s) => ({ ...s, ...newSettings }))}
-          onOpenAdminPanel={handleOpenAdminPanel}
+          onOpenAdminPanel={isAdmin ? handleOpenAdminPanel : undefined}
         />
       )}
 

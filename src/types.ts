@@ -71,6 +71,7 @@ export interface UserProfile {
   totalWins: number;
   totalWonAmount: number;
   role?: string;
+  is_admin?: boolean;
   playerCode?: string;
   status?: 'active' | 'blocked';
   is_blocked?: boolean;
